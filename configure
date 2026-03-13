@@ -1,0 +1,102 @@
+#!/bin/bash
+
+# Vortex Benchmarks Configuration Script
+# Validates environment and generates config.mk from config.mk.in
+
+set -e
+
+# Defaults
+XLEN=32
+TOOLDIR=${TOOLDIR:-$HOME/tools}
+VORTEX_HOME=${VORTEX_HOME:-}
+VORTEX_BUILD=""
+
+# Parse arguments
+for arg in "$@"; do
+    case $arg in
+        --xlen=*)    XLEN="${arg#*=}" ;;
+        --tooldir=*) TOOLDIR="${arg#*=}" ;;
+        --vortex=*)  VORTEX_HOME="${arg#*=}" ;;
+        --build=*)   VORTEX_BUILD="${arg#*=}" ;;
+        --help|-h)
+            echo "Usage: ./configure [options]"
+            echo ""
+            echo "Options:"
+            echo "  --xlen=32|64        RISC-V address width (default: 32)"
+            echo "  --tooldir=PATH      Toolchain directory (default: \$HOME/tools)"
+            echo "  --vortex=PATH       Vortex source root (default: \$VORTEX_HOME env var)"
+            echo "  --build=PATH        Vortex build directory (default: \$VORTEX_HOME/build)"
+            echo ""
+            echo "Environment variables:"
+            echo "  VORTEX_HOME         Path to Vortex source tree"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg"
+            echo "Run ./configure --help for usage"
+            exit 1
+            ;;
+    esac
+done
+
+# Validate VORTEX_HOME
+if [ -z "$VORTEX_HOME" ]; then
+    echo "Error: VORTEX_HOME is not set."
+    echo "Set it via: export VORTEX_HOME=/path/to/vortex"
+    echo "Or pass:    ./configure --vortex=/path/to/vortex"
+    exit 1
+fi
+
+if [ ! -d "$VORTEX_HOME" ]; then
+    echo "Error: VORTEX_HOME=$VORTEX_HOME does not exist"
+    exit 1
+fi
+
+# Default build dir to VORTEX_HOME/build
+if [ -z "$VORTEX_BUILD" ]; then
+    VORTEX_BUILD="$VORTEX_HOME/build"
+fi
+
+# Check required Vortex source directories
+for dir in kernel hw; do
+    if [ ! -d "$VORTEX_HOME/$dir" ]; then
+        echo "Error: $VORTEX_HOME/$dir not found. Is this a Vortex source tree?"
+        exit 1
+    fi
+done
+
+# Check required Vortex build artifacts
+for artifact in runtime/libvortex.so kernel/libvortex.a; do
+    if [ ! -f "$VORTEX_BUILD/$artifact" ]; then
+        echo "Error: $VORTEX_BUILD/$artifact not found. Is Vortex built?"
+        exit 1
+    fi
+done
+
+# Detect OS version
+if [ -f /etc/os-release ]; then
+    OSVERSION=$(grep -oP 'VERSION_ID="\K[^"]+' /etc/os-release 2>/dev/null || echo "unknown")
+else
+    OSVERSION="unknown"
+fi
+
+echo "Configuration:"
+echo "  VORTEX_HOME  = $VORTEX_HOME  (source)"
+echo "  VORTEX_BUILD = $VORTEX_BUILD (build artifacts)"
+echo "  XLEN         = $XLEN"
+echo "  TOOLDIR      = $TOOLDIR"
+echo "  OSVERSION    = $OSVERSION"
+
+# Generate config.mk from template
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+sed -e "s|@VORTEX_HOME@|$VORTEX_HOME|g" \
+    -e "s|@VORTEX_BUILD@|$VORTEX_BUILD|g" \
+    -e "s|@XLEN@|$XLEN|g" \
+    -e "s|@TOOLDIR@|$TOOLDIR|g" \
+    -e "s|@OSVERSION@|$OSVERSION|g" \
+    "$SCRIPT_DIR/config.mk.in" > "$SCRIPT_DIR/config.mk"
+
+echo ""
+echo "Generated config.mk successfully."
+echo "Run 'make' to build all benchmarks, or 'make <benchmark>' for a specific one."

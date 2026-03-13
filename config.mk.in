@@ -1,0 +1,20 @@
+VORTEX_HOME  ?= @VORTEX_HOME@
+VORTEX_BUILD ?= @VORTEX_BUILD@
+XLEN         ?= @XLEN@
+TOOLDIR      ?= @TOOLDIR@
+OSVERSION    ?= @OSVERSION@
+
+# Vortex toolchain paths (matches Vortex's own config.mk naming)
+LLVM_VORTEX          ?= $(TOOLDIR)/llvm-vortex
+RISCV_TOOLCHAIN_PATH ?= $(TOOLDIR)/riscv$(XLEN)-gnu-toolchain
+RISCV_PREFIX         ?= riscv$(XLEN)-unknown-elf
+RISCV_SYSROOT        ?= $(RISCV_TOOLCHAIN_PATH)/$(RISCV_PREFIX)
+LIBC_VORTEX          ?= $(TOOLDIR)/libc$(XLEN)
+LIBCRT_VORTEX        ?= $(TOOLDIR)/libcrt$(XLEN)
+
+# Third-party and common paths (from Vortex source)
+THIRD_PARTY_DIR ?= $(VORTEX_HOME)/third_party
+SW_COMMON_DIR   ?= $(VORTEX_HOME)/sim/common
+
+# Benchmark repo root
+BENCH_ROOT := $(dir $(lastword $(MAKEFILE_LIST)))
