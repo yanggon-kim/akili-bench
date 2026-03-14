@@ -79,7 +79,7 @@ run_test() {
 if [ $# -gt 0 ]; then
     BENCHES="$@"
 else
-    BENCHES="flash attention llama2 cnn_kernels/conv cnn_kernels/im2col cnn_kernels/pool cnn_kernels/relu cnn cnn_kernels/sgemm acccnn"
+    BENCHES="flash flash_tcu attention llama2 cnn_kernels/conv cnn_kernels/im2col cnn_kernels/pool cnn_kernels/relu cnn cnn_kernels/sgemm acccnn"
 fi
 
 echo "============================================"
@@ -90,7 +90,11 @@ echo ""
 for bench in $BENCHES; do
     case "$bench" in
         flash)
-            run_test "flash" "flash"
+            run_test "flash (SIMT)" "flash"
+            ;;
+        flash_tcu)
+            # TCU mode — requires Vortex built with: CONFIGS="-DEXT_TCU_ENABLE" make -s
+            run_test "flash (TCU)" "flash" CONFIGS="-DNUM_THREADS=8 -DEXT_TCU_ENABLE" OPTS="-n 64 -d 8 -t 1"
             ;;
         attention)
             run_test "attention" "attention"
