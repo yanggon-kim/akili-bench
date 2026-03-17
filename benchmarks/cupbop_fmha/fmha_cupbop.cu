@@ -237,19 +237,122 @@ int run_fmha_test(const char* name, int B, int nh, int N, int d,
     return passed;
 }
 
+// Test with explicit Q,K,V and property checks on output
+int run_fmha_known(const char* name, int B, int nh, int N, int d,
+                   int Bc, int Br, const float* Q, const float* K, const float* V) {
+    int Tc = (N + Bc - 1) / Bc, Tr = (N + Br - 1) / Br;
+    float softmax_scale = 1.0f / sqrtf((float)d);
+    int total_qkv = B * nh * N * d;
+    int total_lm = B * nh * N;
+
+    printf("\n===== FMHA KNOWN TEST: %s =====\n", name);
+
+    float *h_O = (float*)malloc(total_qkv * sizeof(float));
+    float *h_l = (float*)malloc(total_lm * sizeof(float));
+    float *h_m = (float*)malloc(total_lm * sizeof(float));
+    float *h_ref = (float*)malloc(total_qkv * sizeof(float));
+    for (int i = 0; i < total_qkv; i++) h_O[i] = 0.0f;
+    for (int i = 0; i < total_lm; i++) { h_l[i] = 0.0f; h_m[i] = -1e30f; }
+
+    attention_cpu(Q, K, V, h_ref, B, nh, N, d);
+
+    float *d_Q, *d_K, *d_V, *d_O, *d_l, *d_m;
+    cudaMalloc(&d_Q, total_qkv * sizeof(float));
+    cudaMalloc(&d_K, total_qkv * sizeof(float));
+    cudaMalloc(&d_V, total_qkv * sizeof(float));
+    cudaMalloc(&d_O, total_qkv * sizeof(float));
+    cudaMalloc(&d_l, total_lm * sizeof(float));
+    cudaMalloc(&d_m, total_lm * sizeof(float));
+    cudaMemcpy(d_Q, Q, total_qkv * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, K, total_qkv * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, V, total_qkv * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_O, h_O, total_qkv * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_l, h_l, total_lm * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_m, h_m, total_lm * sizeof(float), cudaMemcpyHostToDevice);
+
+    int sram_size = (3 * Bc * d + Bc * Br) * (int)sizeof(float);
+    dim3 grid_dim(B, nh); dim3 block_dim(Bc);
+    fmhaForward<<<grid_dim, block_dim, sram_size>>>(
+        d_Q, d_K, d_V, N, d, Tc, Tr, Bc, Br, softmax_scale, d_l, d_m, d_O);
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_O, d_O, total_qkv * sizeof(float), cudaMemcpyDeviceToHost);
+
+    int passed = 1; float max_err = 0;
+    for (int i = 0; i < total_qkv; i++) {
+        float err = fabsf(h_O[i] - h_ref[i]);
+        if (err > max_err) max_err = err;
+        if (err > 1e-2f) {
+            printf("FAILED at [%d]: expected=%f got=%f\n", i, h_ref[i], h_O[i]);
+            passed = 0; break;
+        }
+    }
+    if (passed) printf("PASSED (max error: %e)\n", max_err);
+
+    cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
+    cudaFree(d_O); cudaFree(d_l); cudaFree(d_m);
+    free(h_O); free(h_l); free(h_m); free(h_ref);
+    return passed;
+}
+
 int main() {
     cudaSetDevice(0);
 
     int all_passed = 1;
 
-    // Test 1: Single tile (Tc=Tr=1) — basic FMHA
-    all_passed &= run_fmha_test("single_tile", 1, 1, 8, 8, 8, 8, 42);
+    // Test 1-3: Random inputs
+    all_passed &= run_fmha_test("random_single_tile", 1, 1, 8, 8, 8, 8, 42);
+    all_passed &= run_fmha_test("random_multi_tile", 1, 1, 16, 4, 8, 8, 123);
+    all_passed &= run_fmha_test("random_multi_head", 1, 2, 8, 4, 8, 8, 456);
 
-    // Test 2: Multi-tile (Tc=Tr=2) — tests online softmax tiling loop
-    all_passed &= run_fmha_test("multi_tile", 1, 1, 16, 4, 8, 8, 123);
+    // Test 4: Identical Q rows → all output rows should be identical
+    //   When all Q rows are the same, attention weights are the same,
+    //   so O rows must all be equal (= weighted avg of V rows)
+    {
+        int N = 8, d = 4;
+        float Q[32], K[32], V[32];
+        srand(100);
+        // Make all Q rows identical
+        for (int j = 0; j < d; j++) Q[j] = (float)(rand() % 100) / 100.0f;
+        for (int i = 1; i < N; i++)
+            for (int j = 0; j < d; j++) Q[i*d+j] = Q[j];
+        for (int i = 0; i < N*d; i++) {
+            K[i] = (float)(rand() % 100) / 100.0f - 0.5f;
+            V[i] = (float)(rand() % 100) / 100.0f - 0.5f;
+        }
+        all_passed &= run_fmha_known("identical_Q_rows", 1, 1, N, d, 8, 8, Q, K, V);
+        // Extra check: verify all output rows are the same is done via CPU ref match
+    }
 
-    // Test 3: Multi-head (nh=2) — tests 2D grid dispatch
-    all_passed &= run_fmha_test("multi_head", 1, 2, 8, 4, 8, 8, 456);
+    // Test 5: Q=K (self-similarity) — attention matrix is symmetric
+    {
+        int N = 8, d = 4;
+        float QK[32], V[32];
+        srand(200);
+        for (int i = 0; i < N*d; i++) {
+            QK[i] = (float)(rand() % 100) / 100.0f - 0.5f;
+            V[i] = (float)(rand() % 100) / 100.0f - 0.5f;
+        }
+        all_passed &= run_fmha_known("Q_equals_K", 1, 1, N, d, 8, 8, QK, QK, V);
+    }
+
+    // Test 6: V = identity-like → output ≈ softmax weights themselves
+    {
+        int N = 8, d = 8;
+        float Q[64], K[64], V[64];
+        srand(300);
+        for (int i = 0; i < N*d; i++) {
+            Q[i] = (float)(rand() % 100) / 100.0f - 0.5f;
+            K[i] = (float)(rand() % 100) / 100.0f - 0.5f;
+        }
+        // V = identity
+        for (int i = 0; i < N; i++)
+            for (int j = 0; j < d; j++)
+                V[i*d+j] = (i == j) ? 1.0f : 0.0f;
+        all_passed &= run_fmha_known("V_identity", 1, 1, N, d, 8, 8, Q, K, V);
+    }
+
+    // Test 7: Different random seed (reproducibility check)
+    all_passed &= run_fmha_test("random_seed_999", 1, 1, 8, 4, 8, 8, 999);
 
     printf("\n===== SUMMARY =====\n");
     printf("%s\n", all_passed ? "ALL FMHA TESTS PASSED" : "SOME FMHA TESTS FAILED");

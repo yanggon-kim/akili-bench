@@ -143,14 +143,66 @@ int main() {
     cudaSetDevice(0);
     int ok = 1;
 
-    // Test 1: 2 batches, 8x8 (tests blockIdx.z dispatch)
-    ok &= run_test("batch2_8x8", 2, 8, 8, 8, 1.0f, 0.0f, 42);
+    // Test 1-3: Random
+    ok &= run_test("random_batch2_8x8", 2, 8, 8, 8, 1.0f, 0.0f, 42);
+    ok &= run_test("random_batch4_k16", 4, 8, 8, 16, 1.0f, 0.0f, 123);
+    ok &= run_test("random_alpha_beta", 2, 8, 8, 8, 2.0f, 0.5f, 456);
 
-    // Test 2: 4 batches, multi-tile
-    ok &= run_test("batch4_8x8_k16", 4, 8, 8, 16, 1.0f, 0.0f, 123);
+    // Test 4: Identity — each batch: A * I = A
+    {
+        int B = 2, M = 8, N = 8, K = 8;
+        int sA = B*M*K, sB = B*K*N, sC = B*M*N;
+        float *hA = (float*)malloc(sA*4), *hB = (float*)malloc(sB*4);
+        float *hC = (float*)malloc(sC*4), *hR = (float*)malloc(sC*4);
+        for (int b = 0; b < B; b++)
+            for (int i = 0; i < M; i++)
+                for (int j = 0; j < K; j++) {
+                    hA[b*M*K + i*K + j] = (float)(b*100 + i*K + j + 1);
+                    hB[b*K*N + i*N + j] = (i == j) ? 1.0f : 0.0f;
+                }
+        for (int i = 0; i < sC; i++) hC[i] = 0;
+        bgemm_cpu(hA, hB, hC, M, N, K, B, 1.0f, 0.0f);
 
-    // Test 3: Batched with alpha/beta
-    ok &= run_test("batch2_alpha_beta", 2, 8, 8, 8, 2.0f, 0.5f, 456);
+        float *dA, *dB, *dC;
+        cudaMalloc(&dA, sA*4); cudaMalloc(&dB, sB*4); cudaMalloc(&dC, sC*4);
+        cudaMemcpy(dA, hA, sA*4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dB, hB, sB*4, cudaMemcpyHostToDevice);
+        float *zeros = (float*)malloc(sC*4);
+        for (int i = 0; i < sC; i++) zeros[i] = 0;
+        cudaMemcpy(dC, zeros, sC*4, cudaMemcpyHostToDevice);
+
+        dim3 block(TILE_N, TILE_M);
+        dim3 grid((N+TILE_N-1)/TILE_N, (M+TILE_M-1)/TILE_M, B);
+        batched_gemm_kernel<<<grid, block>>>(dA, dB, dC, M, N, K, B, 1.0f, 0.0f);
+        cudaDeviceSynchronize();
+
+        float *hO = (float*)malloc(sC*4);
+        cudaMemcpy(hO, dC, sC*4, cudaMemcpyDeviceToHost);
+
+        int passed = 1; float maxe = 0;
+        printf("\n===== BATCHED GEMM KNOWN TEST: identity_per_batch =====\n");
+        for (int i = 0; i < sC; i++) {
+            float e = fabsf(hO[i] - hC[i]);
+            if (e > maxe) maxe = e;
+            if (e > 1e-3f) { printf("FAILED at [%d]\n", i); passed = 0; break; }
+        }
+        // Check batch independence: batch 0 and batch 1 have different values
+        if (passed && fabsf(hO[0] - hO[M*N]) < 1e-6f) {
+            printf("FAILED: batches not independent (same output)\n");
+            passed = 0;
+        }
+        if (passed) printf("PASSED (max error: %e)\n", maxe);
+        ok &= passed;
+
+        cudaFree(dA); cudaFree(dB); cudaFree(dC);
+        free(hA); free(hB); free(hC); free(hR); free(hO); free(zeros);
+    }
+
+    // Test 5: Single batch (degenerate case, batch=1)
+    ok &= run_test("single_batch", 1, 8, 8, 8, 1.0f, 0.0f, 789);
+
+    // Test 6: alpha=0 → result = beta*C (GEMM product ignored)
+    ok &= run_test("alpha0_keeps_C", 2, 8, 8, 8, 0.0f, 1.0f, 321);
 
     printf("\n===== SUMMARY =====\n");
     printf("%s\n", ok ? "ALL BATCHED GEMM TESTS PASSED" : "SOME TESTS FAILED");

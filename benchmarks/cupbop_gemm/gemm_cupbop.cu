@@ -158,22 +158,87 @@ int run_gemm_test(const char* name, int M, int N, int K,
     return passed;
 }
 
+// Known-value test with explicit A, B, expected C
+int run_known_gemm(const char* name, const float* A, const float* B,
+                   const float* expected_C, int M, int N, int K,
+                   float alpha, float beta) {
+    int sizeA = M * K, sizeB = K * N, sizeC = M * N;
+
+    printf("\n===== GEMM KNOWN TEST: %s =====\n", name);
+
+    float *h_C = (float*)malloc(sizeC * sizeof(float));
+    for (int i = 0; i < sizeC; i++) h_C[i] = 0.0f;
+
+    float *d_A, *d_B, *d_C;
+    cudaMalloc(&d_A, sizeA * sizeof(float));
+    cudaMalloc(&d_B, sizeB * sizeof(float));
+    cudaMalloc(&d_C, sizeC * sizeof(float));
+    cudaMemcpy(d_A, A, sizeA * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, B, sizeB * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_C, h_C, sizeC * sizeof(float), cudaMemcpyHostToDevice);
+
+    dim3 block(TILE_N, TILE_M);
+    dim3 grid((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
+    gemm_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_C, d_C, sizeC * sizeof(float), cudaMemcpyDeviceToHost);
+
+    int passed = 1;
+    float max_err = 0;
+    for (int i = 0; i < sizeC; i++) {
+        float err = fabsf(h_C[i] - expected_C[i]);
+        if (err > max_err) max_err = err;
+        if (err > 1e-3f) {
+            printf("FAILED at [%d]: expected=%f got=%f\n", i, expected_C[i], h_C[i]);
+            passed = 0; break;
+        }
+    }
+    if (passed) printf("PASSED (max error: %e)\n", max_err);
+
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    free(h_C);
+    return passed;
+}
+
 int main() {
     cudaSetDevice(0);
 
     int all_passed = 1;
 
-    // Test 1: Square GEMM (basic, single tile per dim)
-    //   8x8 * 8x8 → 1 block of (8,8) threads
-    all_passed &= run_gemm_test("square_8x8", 8, 8, 8, 1.0f, 0.0f, 42);
+    // Test 1-3: Random
+    all_passed &= run_gemm_test("random_8x8", 8, 8, 8, 1.0f, 0.0f, 42);
+    all_passed &= run_gemm_test("random_16x16", 16, 16, 16, 1.0f, 0.0f, 123);
+    all_passed &= run_gemm_test("random_alpha_beta", 8, 8, 16, 2.0f, 0.5f, 456);
 
-    // Test 2: Multi-tile GEMM (tests tiling loop)
-    //   16x16 * 16x16 → 2x2 grid of (8,8) blocks, K tiled 2x
-    all_passed &= run_gemm_test("multi_tile_16x16", 16, 16, 16, 1.0f, 0.0f, 123);
+    // Test 4: Identity matrix — A * I = A
+    {
+        float A[64], I[64], expected[64];
+        for (int i = 0; i < 8; i++)
+            for (int j = 0; j < 8; j++) {
+                A[i*8+j] = (float)(i * 8 + j + 1);  // [1..64]
+                I[i*8+j] = (i == j) ? 1.0f : 0.0f;
+                expected[i*8+j] = A[i*8+j];          // A * I = A
+            }
+        all_passed &= run_known_gemm("identity_AI_eq_A", A, I, expected, 8, 8, 8, 1.0f, 0.0f);
+    }
 
-    // Test 3: Rectangular with beta (tests epilogue alpha*AB + beta*C)
-    //   8x16 * 16x8, alpha=2.0, beta=0.5
-    all_passed &= run_gemm_test("rect_alpha_beta", 8, 8, 16, 2.0f, 0.5f, 456);
+    // Test 5: All-ones — each element of C = K (sum of K ones)
+    {
+        float ones_A[64], ones_B[64], expected[64];
+        for (int i = 0; i < 64; i++) { ones_A[i] = 1.0f; ones_B[i] = 1.0f; }
+        for (int i = 0; i < 64; i++) expected[i] = 8.0f;  // 8x8, K=8: sum=8
+        all_passed &= run_known_gemm("all_ones_sum_K", ones_A, ones_B, expected, 8, 8, 8, 1.0f, 0.0f);
+    }
+
+    // Test 6: Zero matrix — A * 0 = 0
+    {
+        float A[64], Z[64], expected[64];
+        for (int i = 0; i < 64; i++) { A[i] = (float)(i+1); Z[i] = 0.0f; expected[i] = 0.0f; }
+        all_passed &= run_known_gemm("zero_matrix", A, Z, expected, 8, 8, 8, 1.0f, 0.0f);
+    }
+
+    // Test 7: alpha=0, beta=1 → C stays unchanged (C = 0*AB + 1*C = C)
+    all_passed &= run_gemm_test("alpha0_beta1_noop", 8, 8, 8, 0.0f, 1.0f, 777);
 
     printf("\n===== SUMMARY =====\n");
     printf("%s\n", all_passed ? "ALL GEMM TESTS PASSED" : "SOME GEMM TESTS FAILED");
