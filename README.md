@@ -19,6 +19,42 @@ Each benchmark is a self-contained directory that links against an external Vort
 | `cnn_kernels/sgemm` | TCU SGEMM microbenchmark (requires `-DEXT_TCU_ENABLE`) |
 | `llama2` | Llama-2 transformer inference (stories15M model) |
 
+### Single-Op Kernel Benchmarks (`kb_*`)
+
+| Benchmark | Description |
+|---|---|
+| `kb_elu` | ELU activation |
+| `kb_gelu` | GELU activation |
+| `kb_layernorm` | Layer normalization |
+| `kb_leaky_relu` | Leaky ReLU activation |
+| `kb_matvec` | Matrix-vector multiplication |
+| `kb_max_reduce` | Max reduction |
+| `kb_mean_reduce` | Mean reduction |
+| `kb_relu` | ReLU activation |
+| `kb_rmsnorm` | RMS normalization |
+| `kb_sgemm` | Single-precision GEMM |
+| `kb_sigmoid` | Sigmoid activation |
+| `kb_softmax` | Softmax |
+| `kb_softplus` | Softplus activation |
+| `kb_sum_reduce` | Sum reduction |
+| `kb_swish` | Swish activation |
+| `kb_tanh` | Tanh activation |
+
+### Fused-Op Kernel Benchmarks (`kb2_*`)
+
+| Benchmark | Description |
+|---|---|
+| `kb2_attention_score` | Fused attention score (matmul + scale + softmax) |
+| `kb2_gemm_add_relu` | Fused GEMM + bias add + ReLU |
+| `kb2_gemm_div_sum_scale` | Fused GEMM + division + sum + scale |
+| `kb2_gemm_layernorm` | Fused GEMM + layer normalization |
+| `kb2_gemm_mul_leakyrelu` | Fused GEMM + elementwise multiply + leaky ReLU |
+| `kb2_gemm_rmsnorm_swiglu` | Fused GEMM + RMSNorm + SwiGLU |
+| `kb2_gemm_silu_mul` | Fused GEMM + SiLU + elementwise multiply |
+| `kb2_matmul_scale_residadd_clamp` | Fused matmul + scale + residual add + clamp |
+| `kb2_matmul_softmax` | Fused matmul + softmax |
+| `kb2_matmul_sum_max_avgpool` | Fused matmul + sum + max + average pooling |
+
 ## Prerequisites
 
 - **Vortex** — cloned and fully built (runtime, kernel, simulator): https://github.com/vortexgpgpu/vortex
@@ -248,7 +284,9 @@ vortex-benchmarks/
 │   │   ├── pool/
 │   │   ├── relu/
 │   │   └── sgemm/
-│   └── llama2/                   #   Llama-2 inference
+│   ├── llama2/                   #   Llama-2 inference
+│   ├── kb_*/                     #   16 single-op kernel benchmarks
+│   └── kb2_*/                    #   10 fused-op kernel benchmarks
 ```
 
 ## Contributors
