@@ -1,5 +1,6 @@
 #include <vx_spawn.h>
 #include <vx_tensor.h>
+#include <vx_print.h>
 #include <cmath>
 #include <cstring>
 #include "common.h"
@@ -171,15 +172,15 @@ static void flashattention_tcu(kernel_arg_t* arg) {
   uint32_t tid = threadIdx.x;
   uint32_t global_row_start = tile_row * 8;
   
-  // Load Q tile (row by row)
+  // Load Q tile (zero first, then load 8x8 data)
+  for (uint32_t i = tid; i < TCU_K * TCU_K; i += blockDim.x) {
+    local_Q[i] = 0;
+  }
   for (uint32_t local_r = 0; local_r < 8; local_r++) {
     for (uint32_t c = tid; c < 8; c += blockDim.x) {
       uint32_t global_row = global_row_start + local_r;
       local_Q[local_r * TCU_K + c] = f2h(Q_ptr[global_row * 8 + c]);
     }
-  }
-  for (uint32_t i = 64 + tid; i < TCU_K * TCU_K; i += blockDim.x) {
-    local_Q[i] = 0;
   }
 
   // Initialize stats
@@ -202,26 +203,26 @@ static void flashattention_tcu(kernel_arg_t* arg) {
   for (uint32_t kv_block = 0; kv_block < seq_len / 8; kv_block++) {
     uint32_t kv_row_start = kv_block * 8;
     
-    // Load K (transposed)
+    // Load K row-major (col_major load will transpose for Q*K^T)
+    for (uint32_t i = tid; i < TCU_K * TCU_K; i += blockDim.x) {
+      local_K[i] = 0;
+    }
     for (uint32_t local_r = 0; local_r < 8; local_r++) {
       for (uint32_t c = tid; c < 8; c += blockDim.x) {
         uint32_t global_row = kv_row_start + local_r;
-        local_K[c * TCU_K + local_r] = f2h(K_ptr[global_row * 8 + c]);
+        local_K[local_r * TCU_K + c] = f2h(K_ptr[global_row * 8 + c]);
       }
     }
-    for (uint32_t idx = 64 + tid; idx < TCU_K * TCU_K; idx += blockDim.x) {
-      local_K[idx] = 0;
-    }
 
-    // Load V (transposed)
+    // Load V (transposed for PV = P*V; col_major load gives B=V)
+    for (uint32_t i = tid; i < TCU_K * TCU_K; i += blockDim.x) {
+      local_Vh[i] = 0;
+    }
     for (uint32_t local_r = 0; local_r < 8; local_r++) {
       for (uint32_t c = tid; c < 8; c += blockDim.x) {
         uint32_t global_row = kv_row_start + local_r;
         local_Vh[c * TCU_K + local_r] = f2h(V_ptr[global_row * 8 + c]);
       }
-    }
-    for (uint32_t idx = 64 + tid; idx < TCU_K * TCU_K; idx += blockDim.x) {
-      local_Vh[idx] = 0;
     }
 
     __syncthreads();
@@ -271,7 +272,12 @@ static void flashattention_tcu(kernel_arg_t* arg) {
     }
     __syncthreads();
 
-    // Update stats and weight P
+    // Zero P buffer, then update stats and write weighted P
+    for (uint32_t i = tid; i < TCU_K * TCU_K; i += blockDim.x) {
+      local_K[i] = 0;
+    }
+    __syncthreads();
+
     if (tid < 8) {
       uint32_t r = tid;
       float rowmax = shared_maxval[r];
@@ -290,19 +296,14 @@ static void flashattention_tcu(kernel_arg_t* arg) {
         row_O[r * 8 + c] *= w_old;
       }
 
-      // Weight probabilities
+      // Weight probabilities into zeroed P buffer
       for (uint32_t c = 0; c < 8; ++c) {
-        float p = h2f(local_K[r * TCU_K + c]);  // TCU_K stride!
+        float p = local_S[r * TCU_K + c];  // read prob from local_S
         local_K[r * TCU_K + c] = f2h(w_new * p);
       }
 
       row_m[r] = m_new;
       row_l[r] = l_new;
-    }
-
-    // Pad P
-    for (uint32_t idx = 64 + tid; idx < TCU_K * TCU_K; idx += blockDim.x) {
-      local_K[idx] = 0;
     }
     __syncthreads();
 
@@ -312,6 +313,7 @@ static void flashattention_tcu(kernel_arg_t* arg) {
     tcu_ctx::load_matrix_sync<vt::col_major>(fragV, local_Vh, TCU_K);
     tcu_ctx::mma_sync(fragPV, fragA, fragV, fragPV);
     tcu_ctx::store_matrix_sync(local_S, fragPV, TCU_K);  // Stores with stride TCU_K!
+    asm volatile ("fence" ::: "memory");
 
     __syncthreads();
 

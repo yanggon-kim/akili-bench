@@ -1,3 +1,0 @@
-# Git LFS tracking for binary data files
-*.bin filter=lfs diff=lfs merge=lfs -text
-*.vxbin filter=lfs diff=lfs merge=lfs -text
