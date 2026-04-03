@@ -18,6 +18,8 @@ benchmarks/kbt_*/kbt_*
 benchmarks/kb_*/kb_*
 benchmarks/kb2_*/kb2_*
 benchmarks/triton_*/triton_*
+benchmarks/nerf_*/nerf_*
+benchmarks/ngp_*/ngp_*
 *.vxbin
 ramulator.stats.log
 

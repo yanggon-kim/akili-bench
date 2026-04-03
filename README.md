@@ -55,6 +55,24 @@ Each benchmark is a self-contained directory that links against an external Vort
 | `kb2_matmul_softmax` | Fused matmul + softmax |
 | `kb2_matmul_sum_max_avgpool` | Fused matmul + sum + max + average pooling |
 
+### NeRF/NGP Kernel Benchmarks (`nerf_*`, `ngp_*`)
+
+Per-ray 3D rendering kernels converted from [nerfacc](https://github.com/nerfstudio-project/nerfacc) and [torch-ngp](https://github.com/ashawkey/torch-ngp). Original CUDA source in `benchmarks/cuda_reference/`.
+
+| Benchmark | Source | Description |
+|---|---|---|
+| `nerf_ray_aabb_intersect` | nerfacc | Ray-AABB intersection (tmin/tmax/hit) |
+| `nerf_traverse_grid` | nerfacc | DDA ray marching through 3D occupancy grid |
+| `nerf_exclusive_prod` | nerfacc | Per-ray exclusive prefix product (transmittance) |
+| `nerf_inclusive_sum` | nerfacc | Per-ray inclusive prefix sum (accumulation) |
+| `nerf_searchsorted` | nerfacc | Per-ray binary search in sorted arrays |
+| `nerf_importance_sampling` | nerfacc | CDF-based importance resampling |
+| `ngp_packbits` | torch-ngp | Density thresholding into packed bitfield |
+| `ngp_near_far_aabb` | torch-ngp | Ray-AABB near/far with min_near clamping |
+| `ngp_march_rays` | torch-ngp | Ray marching with Morton-coded occupancy grid |
+| `ngp_composite_fwd` | torch-ngp | Volume rendering compositing (forward) |
+| `ngp_composite_bwd` | torch-ngp | Volume rendering compositing (backward/gradient) |
+
 ### TCU Fused-Op Kernel Benchmarks (`kbt_*`)
 
 Tensor core (TCU) variants of the fused-op kernels. These use Vortex's WMMA API (`vx_tensor.h`) with fp16 input / fp32 accumulate tiles, combined with SIMT post-processing for activations and normalization. Each is a direct TCU counterpart to the corresponding `kb2_*` SIMT benchmark, enabling TCU vs SIMT comparison.
@@ -322,7 +340,10 @@ vortex-benchmarks/
 │   ├── llama2/                   #   Llama-2 inference
 │   ├── kb_*/                     #   16 single-op kernel benchmarks
 │   ├── kb2_*/                    #   10 fused-op kernel benchmarks (SIMT)
-│   └── kbt_*/                    #   11 fused-op TCU kernel benchmarks (tensor core)
+│   ├── kbt_*/                    #   11 fused-op TCU kernel benchmarks (tensor core)
+│   ├── nerf_*/                   #   6 nerfacc ray-tracing kernels
+│   ├── ngp_*/                    #   5 torch-ngp neural radiance field kernels
+│   └── cuda_reference/           #   Original CUDA source files
 ```
 
 ## Contributors
