@@ -346,6 +346,32 @@ vortex-benchmarks/
 │   └── cuda_reference/           #   Original CUDA source files
 ```
 
+## Tested Configuration
+
+All benchmarks verified on simx (2026-04-03):
+
+| Parameter | Value |
+|---|---|
+| **Vortex branch** | `reconfig-on-bugfix` @ `13dc5c74e` |
+| **Benchmark branch** | `main` @ `3ffd62ec` |
+| **Simulator** | simx |
+| **XLEN** | 64 |
+| **NUM_CORES** | 1 |
+| **NUM_WARPS** | 4 |
+| **NUM_THREADS** | 8 |
+| **NUM_TCU_LANES** | 8 |
+| **EXT_TCU_ENABLE** | yes |
+| **LMEM_LOG_SIZE** | 14 (16KB) |
+
+| Category | Count | Status |
+|---|---|---|
+| TCU fused-op (`kbt_*`) | 11 | 11/11 PASS |
+| NeRF/NGP (`nerf_*`, `ngp_*`) | 11 | 11/11 PASS |
+| Single-op (`kb_*`) | 16 | — |
+| Fused-op SIMT (`kb2_*`) | 10 | — |
+| Triton-style (`triton_*`) | 4 | — |
+| Pipeline (flash, cnn, llama2, etc.) | 6 | — |
+
 ## Contributors
 
 - **FlashAttention / Attention**: [eyoon1131](https://github.com/eyoon1131/vortex)
