@@ -14,6 +14,12 @@ benchmarks/llama2/llama
 benchmarks/cnn/cnn
 benchmarks/acccnn/acccnn
 benchmarks/cnn_kernels/*/cnn_*
+benchmarks/kbt_*/kbt_*
+benchmarks/kb_*/kb_*
+benchmarks/kb2_*/kb2_*
+benchmarks/triton_*/triton_*
+*.vxbin
+ramulator.stats.log
 
 # Editor/OS
 *.swp

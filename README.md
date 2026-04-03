@@ -55,6 +55,41 @@ Each benchmark is a self-contained directory that links against an external Vort
 | `kb2_matmul_softmax` | Fused matmul + softmax |
 | `kb2_matmul_sum_max_avgpool` | Fused matmul + sum + max + average pooling |
 
+### TCU Fused-Op Kernel Benchmarks (`kbt_*`)
+
+Tensor core (TCU) variants of the fused-op kernels. These use Vortex's WMMA API (`vx_tensor.h`) with fp16 input / fp32 accumulate tiles, combined with SIMT post-processing for activations and normalization. Each is a direct TCU counterpart to the corresponding `kb2_*` SIMT benchmark, enabling TCU vs SIMT comparison.
+
+Requires Vortex built with `-DEXT_TCU_ENABLE`.
+
+| Benchmark | Operation | TCU + SIMT Phases |
+|---|---|---|
+| `kbt_sgemm` | C = A @ B | TCU GEMM |
+| `kbt_gemm_add_relu` | ReLU(x@W + bias) | TCU GEMM + bias + ReLU |
+| `kbt_gemm_mul_leakyrelu` | LeakyReLU((x@W+b)*m) | TCU GEMM + mul + LeakyReLU |
+| `kbt_gemm_div_sum_scale` | scale * sum(GEMM/2) | TCU GEMM + div + sum + scale |
+| `kbt_gemm_layernorm` | LayerNorm(x@W + bias) | TCU GEMM + LayerNorm |
+| `kbt_attention_score` | softmax(Q@K^T / sqrt(d)) | TCU GEMM + scale + softmax |
+| `kbt_matmul_softmax` | softmax(A @ B) | TCU GEMM + softmax |
+| `kbt_matmul_scale_residadd_clamp` | Mish(LSE(clamp(scale(A@B)))) | TCU GEMM + scale + clamp + LSE + Mish |
+| `kbt_matmul_sum_max_avgpool` | sum(A@W + bias) | TCU GEMM + bias + sum |
+| `kbt_gemm_rmsnorm_swiglu` | SiLU(RMSNorm(x)@Wg) * (RMSNorm(x)@Wu) | RMSNorm + 2x TCU GEMM + SiLU*mul |
+| `kbt_gemm_silu_mul` | SiLU(x@Wa+ba) * (x@Wb+bb) | 2x TCU GEMM + SiLU*mul |
+
+**Configuring TCU size:**
+
+```bash
+# Default: NUM_TCU_LANES = NUM_THREADS = 8
+make -C benchmarks/kbt_sgemm run-simx
+
+# Change SIMT width and TCU lanes together
+make -C benchmarks/kbt_sgemm NUM_THREADS=16 run-simx
+
+# Independent: 16 SIMT threads, 4 TCU lanes (smaller tiles, more SIMT parallelism)
+make -C benchmarks/kbt_sgemm NUM_THREADS=16 NUM_TCU_LANES=4 run-simx
+```
+
+> **Note:** Independent `NUM_TCU_LANES != NUM_THREADS` only works with simx. The RTL requires `NUM_TCU_LANES == NUM_THREADS` (full warp execution). A matching Vortex build is required: `CONFIGS="-DNUM_THREADS=16 -DNUM_TCU_LANES=4 -DEXT_TCU_ENABLE" make -s`.
+
 ## Prerequisites
 
 - **Vortex** — cloned and fully built (runtime, kernel, simulator): https://github.com/vortexgpgpu/vortex
@@ -286,7 +321,8 @@ vortex-benchmarks/
 │   │   └── sgemm/
 │   ├── llama2/                   #   Llama-2 inference
 │   ├── kb_*/                     #   16 single-op kernel benchmarks
-│   └── kb2_*/                    #   10 fused-op kernel benchmarks
+│   ├── kb2_*/                    #   10 fused-op kernel benchmarks (SIMT)
+│   └── kbt_*/                    #   11 fused-op TCU kernel benchmarks (tensor core)
 ```
 
 ## Contributors
