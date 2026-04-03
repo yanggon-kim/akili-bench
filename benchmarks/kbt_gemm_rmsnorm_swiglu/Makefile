@@ -8,6 +8,6 @@ CONFIGS ?= -DNUM_THREADS=$(NUM_THREADS) -DNUM_TCU_LANES=$(NUM_TCU_LANES) -DEXT_T
 
 SRCS    := main.cpp
 VX_SRCS := kernel.cpp
-OPTS    ?= -m16 -n16 -p16
+OPTS    ?= -m16 -n16 -p8
 
 include $(BENCH_ROOT)/common/common.mk
