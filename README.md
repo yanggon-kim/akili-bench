@@ -1,3 +1,73 @@
+# Akili Benchmarks — quick start for collaborators
+
+I've added a set of nine self-contained Vortex benchmarks on this repo. They
+cover **attention**, **FlashAttention**, and **2D convolution**, with three
+separate test directories per workload (SIMT, dense TCU, sparse 2:4 TCU).
+Each directory is independent — it has its own `main.cpp`, `kernel.cpp`,
+`common.h`, and `Makefile`, just like `tests/regression/sgemm/`,
+`sgemm_tcu/`, `sgemm_tcu_sp/`.
+
+**Repository**: https://github.com/yanggon-kim/akili-bench
+**Branch**: `akili`  (the tests live on this branch — not `main`)
+
+Clone and switch to the branch:
+
+```bash
+git clone https://github.com/yanggon-kim/akili-bench.git
+cd akili-bench
+git checkout akili
+```
+
+## The nine tests
+
+All nine live under `benchmarks/` once you're on the branch:
+
+| Workload | SIMT | Dense TCU | Sparse TCU (2:4) |
+|---|---|---|---|
+| **Attention** | `benchmarks/akili_attn/` | `benchmarks/akili_attn_tcu/` | `benchmarks/akili_attn_tcu_sp/` |
+| **FlashAttention** | `benchmarks/akili_flash/` | `benchmarks/akili_flash_tcu/` | `benchmarks/akili_flash_tcu_sp/` |
+| **CNN / conv2d** | `benchmarks/akili_cnn/` | `benchmarks/akili_acccnn_tcu/` | `benchmarks/akili_acccnn_tcu_sp/` |
+
+## How to use them — read these first
+
+The `00_doc/` directory in this repo has everything you need:
+
+- **`00_doc/akili_benchmarks.md`** — **start here**. User guide with build
+  commands, CLI flags for each benchmark, expected output, measured
+  dense/SIMT and sparse/dense speedups at NT=8, and a "recommended input
+  sizes" section telling you which shapes actually make sense to run in
+  simx (and which to avoid because they're too slow).
+- **`00_doc/benchmark_status.md`** — implementation status and
+  per-directory build-configuration details (which dirs need
+  `ENABLE_TCU`, which need softfloat, how the shared simx build serves
+  all nine tests, etc.). Read this if you're extending the benchmarks or
+  debugging build errors.
+- **`00_doc/speedup_results_akili.csv`** — raw speedup data backing the
+  tables in `akili_benchmarks.md`, one row per (workload × shape).
+
+## TL;DR to run one
+
+After building Vortex once (`./configure`, `toolchain_env.sh`, `make -s`)
+and rebuilding simx at your target warp width (e.g. `NUM_THREADS=8` with
+`-DEXT_TCU_ENABLE -DTCU_SPARSE_ENABLE`):
+
+```bash
+make -C tests/bench_dir/bench/benchmarks/akili_attn_tcu -s NUM_THREADS=8
+cd tests/bench_dir/bench/benchmarks/akili_attn_tcu
+VORTEX_DRIVER=simx LD_LIBRARY_PATH=<build>/runtime ./akili_attn_tcu -n 64 -d 128
+```
+
+Every binary prints `KCYC[...,nt=<NT>]: <cycles>` lines per kernel stage
+and a final `PASSED!` / `FAILED!`. See Section 2 of
+`00_doc/akili_benchmarks.md` for the full build + run walkthrough.
+
+**Note on the branch**: all of my work is on `akili`, not `main`. `main`
+on this repo is an unchanged snapshot of upstream `vortexgpgpu/bench` —
+don't run it, it doesn't have the akili_* tests. Always start from
+`git checkout akili`.
+
+---
+
 # Vortex Benchmarks
 
 Benchmark suite for the [Vortex RISC-V GPGPU](https://github.com/vortexgpgpu/vortex) processor.
