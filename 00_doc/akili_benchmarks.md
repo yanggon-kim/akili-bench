@@ -290,32 +290,63 @@ shows the dense / sparse TCU benefits most clearly. `simx` is
 cycle-approximate C++ simulation — 1 M device cycles ≈ 1 s of
 simulator wall-clock on a modern host.
 
-### Attention and FlashAttention
+### Attention and FlashAttention — dense TCU wins (all three modes valid)
 
 | Purpose | Shape | Why | ~Wall-clock (NT=8) |
 |---|---|---|---|
 | Quick sanity check   | `-n 16  -d 16`  | Fastest shape. All three modes finish in <1 s each. Use during development to confirm builds still pass. | < 5 s total |
 | First real demo      | `-n 32  -d 32`  | Tiny enough to finish fast but flash drops to the unfused 3-stage path (d > 16), so flash = attention. | ~10 s total |
 | **Dense TCU speedup**  | `-n 64  -d 128` | Dense TCU ~1.7× SIMT on attention / flash. Sparse vs dense still below 1.0× because PV's small K. | ~30 s total |
-| **Strong dense win**   | `-n 64  -d 512` | Dense TCU ~4× SIMT. Sparse vs dense just crosses 1.0×. This is the shape you want for a slide. | ~1 min total |
-| Max realistic in simx | `-n 64  -d 1024` | Dense TCU ~5.6× SIMT (matches the `v3` sweep). SIMT run alone is ~25 M cycles ≈ 25 s. | ~2 min total |
+| **Strong dense win**   | `-n 64  -d 512` | Dense TCU ~4× SIMT. Sparse vs dense just crosses 1.0×. This is the shape you want for a dense-focused slide. | ~1 min total |
+| Max realistic in simx | `-n 64  -d 1024` | Dense TCU ~5.6× SIMT (matches the v3 sweep). SIMT run alone is ~25 M cycles ≈ 25 s. Sparse/dense ≈ 1.14×. | ~2 min total |
 
-**Avoid** `-n ≥ 128` with the SIMT binary — the 2D spawn grid of
-`N × N × d` floating-point ops blows up in simx (you'd wait
-15+ min per SIMT run). The dense / sparse TCU binaries do handle
-bigger `N` comfortably, so if you only care about dense-vs-sparse
-comparisons you can push to `-n 128 -d 2048` or `-n 256 -d 2048`
-(both tractable, both show sparse/dense > 1.2×) — just skip the
-SIMT side of the comparison.
+### Attention and FlashAttention — sparse TCU wins
 
-### CNN / conv2d
+To see **sparse TCU beat dense TCU by a meaningful margin** you have
+to push `n` and `d` together so the softmax and PV's inner-K stages
+become a small fraction of total work. The first row below still has
+a tractable SIMT reference; the two below it are **TCU-only** —
+don't run the SIMT binaries at `n ≥ 128, d ≥ 2048` (they take 30+
+min in simx because the `N² × d` SIMT grid explodes).
 
-| Purpose | Shape | Why | ~Wall-clock (NT=8) |
-|---|---|---|---|
-| Smoke test | `-c 1  -o 8   -h 28 -w 28 -s 3` | Fashion-MNIST conv1 shape. `K_gemm = 16` is one tileK — sparse metadata overhead > savings, so sparse loses to dense here. | ~5 s total |
-| **Small demo** | `-c 16 -o 16  -h 32 -w 32 -s 3` | `K_gemm = 144` — first shape where sparse beats dense (~1.16×). Dense TCU already ~28× over SIMT. | ~1-2 min total |
-| **Recommended** | `-c 32 -o 32  -h 32 -w 32 -s 3` | `K_gemm = 288`. Dense TCU ~30× over SIMT, sparse ~1.26× over dense. This is the shape for most demos and speedup screenshots. | ~5 min total |
-| Upper end | `-c 32 -o 64  -h 32 -w 32 -s 3` | `M_gemm = 64, K_gemm = 288`. Same ratios as medium; proves dense/SIMT is shape-independent in the TCU-friendly regime. SIMT run ~135 M cycles ≈ 8 min. | ~10 min total |
+| Purpose | Shape | dense cyc | sparse cyc | **sparse/dense** | Modes to run | ~Wall-clock (NT=8) |
+|---|---|---|---|---|---|---|
+| **Sparse TCU win (SIMT still valid)** | `-n 64  -d 2048` |  7.48 M |  6.10 M | **1.23×** | all three (SIMT ~50 M cyc ≈ 1 min) | ~2-3 min total |
+| Sparse demo, medium | `-n 128 -d 2048` | 25.59 M | 19.90 M | **1.29×** | TCU dense + TCU sparse only | ~1-2 min (TCU only) |
+| **Strongest sparse (measured)** | `-n 256 -d 2048` | 98.88 M | 73.36 M | **1.35×** | TCU dense + TCU sparse only | ~5-10 min (TCU only) |
+
+The dense/sparse cycle counts above come from the earlier v3 sparse
+-PV sweep; every row passed correctness. To reproduce the TCU-only
+rows, build **just** the two TCU binaries (`akili_attn_tcu` and
+`akili_attn_tcu_sp`, or the flash equivalents) — skip the SIMT
+binary at those shapes:
+
+```bash
+BENCH=tests/bench_dir/bench/benchmarks
+make -C $BENCH/akili_attn_tcu    -s NUM_THREADS=8
+make -C $BENCH/akili_attn_tcu_sp -s NUM_THREADS=8
+(cd $BENCH/akili_attn_tcu    && ./akili_attn_tcu    -n 256 -d 2048)
+(cd $BENCH/akili_attn_tcu_sp && ./akili_attn_tcu_sp -n 256 -d 2048)
+```
+
+### CNN / conv2d — dense AND sparse wins at the same shapes
+
+CNN is the easiest workload to see both speedups at once: any shape
+with `K_gemm ≥ 144` (which means `C_in × K × K ≥ 144`, so `C_in ≥ 16`
+for 3×3 kernels) gets **both** the ~28-30× dense/SIMT win and the
+~1.16-1.26× sparse/dense win in the same run.
+
+| Purpose | Shape | K_gemm | **dense/SIMT** | **sparse/dense** | ~Wall-clock (NT=8) |
+|---|---|---|---|---|---|
+| Smoke test (mnist) | `-c 1  -o 8  -h 28 -w 28 -s 3` |  16 | **11.18×** | 0.89× (sparse loses — K_gemm too small for metadata to amortize) | ~5 s total |
+| **Small: dense + sparse win** | `-c 16 -o 16 -h 32 -w 32 -s 3` | 144 | **28.63×** | **1.16×** | ~1-2 min total |
+| **Recommended: strongest combo** | `-c 32 -o 32 -h 32 -w 32 -s 3` | 288 | **29.72×** | **1.26×** | ~5 min total |
+| Upper end | `-c 32 -o 64 -h 32 -w 32 -s 3` | 288 | **29.71×** | **1.26×** | ~10 min total |
+
+`-c 32 -o 32 -h 32 -w 32 -s 3` (the **Recommended** row) is the
+single best shape for a combined dense-vs-SIMT + sparse-vs-dense
+demo — big enough that both speedups show through clearly, small
+enough that SIMT finishes in ~5 min.
 
 **Avoid** `-c 64` or larger with SIMT — the C_in inner loop grows
 linearly, SIMT wall-clock goes above 15 min quickly. Dense /
@@ -324,14 +355,27 @@ to test very large C_in.
 
 ### Rules of thumb for picking shapes
 
-- **Attention / flash**: pick `-n` ≤ 64 in simx. Scale `-d`
-  upward (128 → 512 → 1024) to increase the dense/SIMT ratio.
-  Sparse vs dense needs `d ≥ 512` and `n ≥ 64` to clear 1.0×
-  (the softmax and PV's `K = n_attn` act as anchors otherwise).
-- **CNN**: pick `C_in × K × K` ≥ 144 for sparse to beat dense
-  (at `K = 3` this means `C_in ≥ 16`). Any shape above that gets
-  the full sparse benefit. For dense over SIMT, any non-mnist
-  shape gives you 28-30×.
+- **Attention / flash — dense speedup (vs SIMT)**: pick `-n ≤ 64` so
+  the SIMT binary still finishes in simx, and scale `-d` upward
+  (128 → 512 → 1024) to raise the dense/SIMT ratio from ~1.7× to
+  ~5.6×.
+- **Attention / flash — sparse speedup (vs dense TCU)**: push `n`
+  and `d` together so the softmax + PV anchors shrink as a fraction
+  of total work. The practical shapes are `-n 64 -d 2048` (sparse
+  /dense ≈ 1.23×, SIMT still tractable at ~1 min), `-n 128 -d 2048`
+  (~1.29×, TCU-only), and `-n 256 -d 2048` (~1.35×, the strongest
+  measured — also TCU-only). All three require you to run **only**
+  `akili_*_tcu` and `akili_*_tcu_sp`, not the SIMT binary.
+- **CNN — dense speedup (vs SIMT)**: any non-mnist shape gives
+  28-30×; pick one that finishes in reasonable SIMT wall-clock
+  (avoid `C_in ≥ 64`).
+- **CNN — sparse speedup (vs dense TCU)**: pick `C_in × K × K ≥ 144`
+  (at `K=3` that means `C_in ≥ 16`). Every shape above the
+  threshold gets the full ~1.25× sparse benefit; mnist's
+  `K_gemm = 16` is below the threshold and sparse loses to dense
+  there. Unlike attention/flash, CNN hits both speedups at the
+  same shape — `-c 32 -o 32 -h 32 -w 32 -s 3` is the single-shape
+  sweet spot for a combined demo.
 - **NT sweep**: all the numbers in Section 5 were at NT=8.
   Rebuild simx at NT=4/16/32 if you want to sweep warp width;
   the ratios stay in the same ballpark.
