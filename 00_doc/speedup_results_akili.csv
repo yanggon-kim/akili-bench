@@ -1,0 +1,13 @@
+bench_group,shape_label,shape_params,dir_simt,dir_dense,dir_sparse,simt_cycles,dense_cycles,sparse_cycles,dense_over_simt,sparse_over_dense,status
+attention,S,N=16 d=16,akili_attn,akili_attn_tcu,akili_attn_tcu_sp,718369,706251,726927,1.017,0.972,PASSED
+attention,M,N=32 d=32,akili_attn,akili_attn_tcu,akili_attn_tcu_sp,1841797,1726860,1907601,1.067,0.905,PASSED
+attention,L,N=64 d=128,akili_attn,akili_attn_tcu,akili_attn_tcu_sp,6016719,3556948,3766620,1.692,0.944,PASSED
+attention,XL,N=64 d=512,akili_attn,akili_attn_tcu,akili_attn_tcu_sp,12858096,3171153,3003852,4.055,1.056,PASSED
+flash,S,N=16 d=16,akili_flash,akili_flash_tcu,akili_flash_tcu_sp,1020258,706251,726927,1.445,0.972,PASSED
+flash,M,N=32 d=32,akili_flash,akili_flash_tcu,akili_flash_tcu_sp,1833746,1726860,1907601,1.062,0.905,PASSED
+flash,L,N=64 d=128,akili_flash,akili_flash_tcu,akili_flash_tcu_sp,5965485,3556948,3766620,1.677,0.944,PASSED
+flash,XL,N=64 d=512,akili_flash,akili_flash_tcu,akili_flash_tcu_sp,12691267,3171153,3003852,4.002,1.056,PASSED
+cnn_group,mnist,C_in=1 C_out=8 H=28 K=3,akili_cnn,akili_acccnn_tcu,akili_acccnn_tcu_sp,910563,81464,91374,11.177,0.892,PASSED
+cnn_group,small,C_in=16 C_out=16 H=32 K=3,akili_cnn,akili_acccnn_tcu,akili_acccnn_tcu_sp,18112160,632602,544989,28.631,1.161,PASSED
+cnn_group,medium,C_in=32 C_out=32 H=32 K=3,akili_cnn,akili_acccnn_tcu,akili_acccnn_tcu_sp,67898024,2284659,1816719,29.719,1.258,PASSED
+cnn_group,large,C_in=32 C_out=64 H=32 K=3,akili_cnn,akili_acccnn_tcu,akili_acccnn_tcu_sp,135665614,4566969,3621118,29.706,1.261,PASSED

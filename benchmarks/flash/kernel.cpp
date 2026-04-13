@@ -1,14 +1,23 @@
 #include <vx_spawn.h>
+#include <vx_intrinsics.h>
 #include <vx_tensor.h>
 #include <vx_print.h>
 #include <cmath>
 #include <cstring>
 #include "common.h"
 
-// TCU tile shape (8x8x8 fp16 inputs, fp32 accumulate)
+#ifndef NUM_TCU_LANES
+#define NUM_TCU_LANES NUM_THREADS
+#endif
+
+// TCU tile shape sized to the actual warp width.
 namespace vt = vortex::tensor;
-using tcu_ctx = vt::wmma_context<8, vt::fp16, vt::fp32>;
+using tcu_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32>;
+using sp_ctx  = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
 static constexpr uint32_t TCU_K = tcu_ctx::tileK;
+static constexpr uint32_t TM = tcu_ctx::tileM;
+static constexpr uint32_t TN = tcu_ctx::tileN;
+static constexpr uint32_t TK = tcu_ctx::tileK;
 
 static inline uint16_t f2h(float x) {
   __fp16 h = (__fp16)x;
@@ -341,7 +350,236 @@ static void flashattention_tcu(kernel_arg_t* arg) {
   }
 }
 
+// =============================================================================
+// SIMT unfused attention kernels — one thread per output cell.
+// =============================================================================
+
+void flash_qk_simt(kernel_arg_t* __UNIFORM__ arg) {
+  auto Q = reinterpret_cast<float*>(arg->Q_addr);
+  auto K = reinterpret_cast<float*>(arg->K_addr);
+  auto S = reinterpret_cast<float*>(arg->S_addr);
+  uint32_t N = arg->N;
+  uint32_t d = arg->d;
+  int col = blockIdx.x;
+  int row = blockIdx.y;
+  if (row < (int)N && col < (int)N) {
+    float sum = 0;
+    for (uint32_t e = 0; e < d; ++e) sum += Q[row * d + e] * K[e * N + col];
+    S[row * N + col] = sum;
+  }
+}
+
+void flash_pv_simt(kernel_arg_t* __UNIFORM__ arg) {
+  auto P = reinterpret_cast<float*>(arg->P_addr);
+  auto V = reinterpret_cast<float*>(arg->V_addr);
+  auto O = reinterpret_cast<float*>(arg->O_addr);
+  uint32_t N = arg->N;
+  uint32_t d = arg->d;
+  int col = blockIdx.x;
+  int row = blockIdx.y;
+  if (row < (int)N && col < (int)d) {
+    float sum = 0;
+    for (uint32_t e = 0; e < N; ++e) sum += P[row * N + e] * V[e * d + col];
+    O[row * d + col] = sum;
+  }
+}
+
+// =============================================================================
+// Unfused attention-style TCU kernels (dense + sparse) — used when the fused
+// flashattention_tcu path's hardcoded 8x8 tiles don't line up with this NT.
+// Single-warp: iterate all tile_rows inside.
+// =============================================================================
+
+// Dense Q@Kᵀ → S.  Mirrors sgemm_tcu/kernel.cpp verbatim. One output tile
+// per block via (blockIdx.y, blockIdx.x). Direct global→fragment loads.
+// Host pre-packs Q as fp16 row-major [N×d] and K as fp16 col-major [N×d].
+void flash_qk_tcu(kernel_arg_t* __UNIFORM__ arg) {
+  auto pA = reinterpret_cast<tcu_ctx::input_t*>(arg->Q_addr);
+  auto pB = reinterpret_cast<tcu_ctx::input_t*>(arg->K_addr);
+  auto pC = reinterpret_cast<tcu_ctx::output_t*>(arg->S_addr);
+  uint32_t N_attn = arg->N;
+  uint32_t d_attn = arg->d;
+
+  tcu_ctx::fragment_a   fragA;
+  tcu_ctx::fragment_b   fragB;
+  tcu_ctx::fragment_acc fragC;
+
+  uint32_t tile_row = blockIdx.y * tcu_ctx::tileM;
+  uint32_t tile_col = blockIdx.x * tcu_ctx::tileN;
+
+  tcu_ctx::fill_fragment(fragC, 0);
+
+  for (int i = 0; i < (int)d_attn; i += (int)tcu_ctx::tileK) {
+    auto pTileA = pA + tile_row * d_attn + i;
+    auto pTileB = pB + tile_col * d_attn + i;
+    tcu_ctx::load_matrix_sync(fragA, pTileA, d_attn);
+    tcu_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, d_attn);
+    tcu_ctx::mma_sync(fragC, fragA, fragB, fragC);
+  }
+
+  auto pTileC = pC + tile_row * N_attn + tile_col;
+  tcu_ctx::store_matrix_sync(pTileC, fragC, N_attn);
+}
+
+// Dense P@V → O.  Same sgemm_tcu pattern as flash_qk_tcu, but the GEMM is
+// M=N_attn, N=d_attn, K=N_attn with A=P[N×N] and B=V[d×N] col-major.
+void flash_pv_tcu(kernel_arg_t* __UNIFORM__ arg) {
+  auto pA = reinterpret_cast<tcu_ctx::input_t*>(arg->P_addr);
+  auto pB = reinterpret_cast<tcu_ctx::input_t*>(arg->V_addr);
+  auto pC = reinterpret_cast<tcu_ctx::output_t*>(arg->O_addr);
+  uint32_t N_attn = arg->N;
+  uint32_t d_attn = arg->d;
+
+  tcu_ctx::fragment_a   fragA;
+  tcu_ctx::fragment_b   fragB;
+  tcu_ctx::fragment_acc fragC;
+
+  uint32_t tile_row = blockIdx.y * tcu_ctx::tileM;
+  uint32_t tile_col = blockIdx.x * tcu_ctx::tileN;
+
+  tcu_ctx::fill_fragment(fragC, 0);
+
+  for (int i = 0; i < (int)N_attn; i += (int)tcu_ctx::tileK) {
+    auto pTileA = pA + tile_row * N_attn + i;
+    auto pTileB = pB + tile_col * N_attn + i;
+    tcu_ctx::load_matrix_sync(fragA, pTileA, N_attn);
+    tcu_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, N_attn);
+    tcu_ctx::mma_sync(fragC, fragA, fragB, fragC);
+  }
+
+  auto pTileC = pC + tile_row * d_attn + tile_col;
+  tcu_ctx::store_matrix_sync(pTileC, fragC, d_attn);
+}
+
+// Sparse Q@Kᵀ with compressed fp16 Q + metadata. Mirrors sgemm_tcu_sp.
+void flash_qk_sparse(kernel_arg_t* __UNIFORM__ arg) {
+  auto pA = reinterpret_cast<sp_ctx::input_t*>(arg->Q_addr);       // compressed fp16 Q
+  auto pB = reinterpret_cast<sp_ctx::input_t*>(arg->K_addr);       // fp16 K (col-major)
+  auto pC = reinterpret_cast<sp_ctx::output_t*>(arg->S_addr);
+  auto pMetaSpBase = reinterpret_cast<const float*>(arg->meta_Q_addr);
+
+  uint32_t N_attn = arg->N;
+  uint32_t d_attn = arg->d;
+  uint32_t stride_A = d_attn / 2;
+
+  sp_ctx::fragment_a   fragA;
+  sp_ctx::fragment_b   fragB;
+  sp_ctx::fragment_acc fragC;
+
+  uint32_t tile_row = blockIdx.y * sp_ctx::tileM;
+  uint32_t tile_col = blockIdx.x * sp_ctx::tileN;
+
+  sp_ctx::fill_fragment(fragC, 0);
+
+  constexpr uint32_t rtl_i_ratio = 32 / vt::fp16::bits;
+  constexpr uint32_t meta_cols = (NUM_TCU_LANES * 2 * rtl_i_ratio + 31) / 32;
+  using kcfg = vt::wmma_config_t<NUM_TCU_LANES>;
+  constexpr uint32_t PD = kcfg::m_steps * (kcfg::k_steps / 2);
+  constexpr uint32_t num_meta_loads = (PD * meta_cols + NUM_TCU_LANES - 1) / NUM_TCU_LANES;
+  constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_TCU_LANES;
+
+  uint32_t num_k_tiles = d_attn / sp_ctx::tileK;
+  uint32_t tile_row_idx = blockIdx.y;
+
+  auto pMetaSp = pMetaSpBase + tile_row_idx * num_k_tiles * per_k_tile_words;
+  auto pTileA = pA + tile_row * stride_A;
+  constexpr uint32_t a_k_stride = sp_ctx::tileK / 2;
+
+  auto pTileB = pB + tile_col * d_attn;
+  for (int i = 0; i < (int)d_attn; i += (int)sp_ctx::tileK) {
+    sp_ctx::load_matrix_sync<vt::row_major>(fragA, pTileA, stride_A, nullptr, pMetaSp);
+    sp_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, d_attn);
+    sp_ctx::mma_sync(fragC, fragA, fragB, fragC);
+    pMetaSp += per_k_tile_words;
+    pTileA  += a_k_stride;
+    pTileB  += sp_ctx::tileK;
+  }
+
+  auto pTileC = pC + tile_row * N_attn + tile_col;
+  sp_ctx::store_matrix_sync(pTileC, fragC, N_attn);
+}
+
+// Sparse TCU — O = P @ V with 2:4-compressed P (half K stride) + metadata.
+// GEMM dims M=N_attn, N=d_attn, K=N_attn. Host prunes P post-softmax and
+// stages the compressed buffer + packed metadata via P_addr/meta_P_addr.
+void flash_pv_sparse(kernel_arg_t* __UNIFORM__ arg) {
+  auto pA = reinterpret_cast<sp_ctx::input_t*>(arg->P_addr);
+  auto pB = reinterpret_cast<sp_ctx::input_t*>(arg->V_addr);
+  auto pC = reinterpret_cast<sp_ctx::output_t*>(arg->O_addr);
+  auto pMetaSpBase = reinterpret_cast<const float*>(arg->meta_P_addr);
+
+  uint32_t N_attn = arg->N;
+  uint32_t d_attn = arg->d;
+  uint32_t stride_A = N_attn / 2;
+
+  sp_ctx::fragment_a   fragA;
+  sp_ctx::fragment_b   fragB;
+  sp_ctx::fragment_acc fragC;
+
+  uint32_t tile_row = blockIdx.y * sp_ctx::tileM;
+  uint32_t tile_col = blockIdx.x * sp_ctx::tileN;
+
+  sp_ctx::fill_fragment(fragC, 0);
+
+  constexpr uint32_t rtl_i_ratio = 32 / vt::fp16::bits;
+  constexpr uint32_t meta_cols = (NUM_TCU_LANES * 2 * rtl_i_ratio + 31) / 32;
+  using kcfg = vt::wmma_config_t<NUM_TCU_LANES>;
+  constexpr uint32_t PD = kcfg::m_steps * (kcfg::k_steps / 2);
+  constexpr uint32_t num_meta_loads = (PD * meta_cols + NUM_TCU_LANES - 1) / NUM_TCU_LANES;
+  constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_TCU_LANES;
+
+  uint32_t num_k_tiles = N_attn / sp_ctx::tileK;
+  uint32_t tile_row_idx = blockIdx.y;
+
+  auto pMetaSp = pMetaSpBase + tile_row_idx * num_k_tiles * per_k_tile_words;
+  auto pTileA = pA + tile_row * stride_A;
+  constexpr uint32_t a_k_stride = sp_ctx::tileK / 2;
+
+  auto pTileB = pB + tile_col * N_attn;
+  for (int i = 0; i < (int)N_attn; i += (int)sp_ctx::tileK) {
+    sp_ctx::load_matrix_sync<vt::row_major>(fragA, pTileA, stride_A, nullptr, pMetaSp);
+    sp_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, N_attn);
+    sp_ctx::mma_sync(fragC, fragA, fragB, fragC);
+    pMetaSp += per_k_tile_words;
+    pTileA  += a_k_stride;
+    pTileB  += sp_ctx::tileK;
+  }
+
+  auto pTileC = pC + tile_row * d_attn + tile_col;
+  sp_ctx::store_matrix_sync(pTileC, fragC, d_attn);
+}
+
+// Simple SIMT softmax — single thread per row.
+void flash_softmax_body(kernel_arg_t* __UNIFORM__ arg) {
+  auto S = reinterpret_cast<float*>(arg->S_addr);
+  auto P = reinterpret_cast<float*>(arg->P_addr);
+  uint32_t N = arg->N;
+  int row = blockIdx.x;
+  float max_val = S[row * N];
+  for (uint32_t col = 1; col < N; ++col) {
+    float v = S[row * N + col];
+    if (v > max_val) max_val = v;
+  }
+  float local_P[256];
+  float exp_sum = 0;
+  for (uint32_t col = 0; col < N; ++col) {
+    float e = expf(S[row * N + col] - max_val);
+    local_P[col] = e;
+    exp_sum += e;
+  }
+  for (uint32_t col = 0; col < N; ++col) P[row * N + col] = local_P[col] / exp_sum;
+}
+
 void flash_kernel_entry(kernel_arg_t* arg) {
+  // Dispatch via kernel_id (set by host) for the unfused attention-style path.
+  if (arg->kernel_id == KID_QK_SIMT)    { flash_qk_simt(arg);     return; }
+  if (arg->kernel_id == KID_PV_SIMT)    { flash_pv_simt(arg);     return; }
+  if (arg->kernel_id == KID_QK_TCU)     { flash_qk_tcu(arg);      return; }
+  if (arg->kernel_id == KID_PV_TCU)     { flash_pv_tcu(arg);      return; }
+  if (arg->kernel_id == KID_QK_SPARSE)  { flash_qk_sparse(arg);   return; }
+  if (arg->kernel_id == KID_PV_SPARSE)  { flash_pv_sparse(arg);   return; }
+  if (arg->kernel_id == KID_SOFTMAX)    { flash_softmax_body(arg);return; }
+
   if (arg->kernel_type == 1 && arg->head_dim == 8 && arg->block_size_r == 8 && arg->block_size_c == 8) {
     flashattention_tcu(arg);
     return;
@@ -417,6 +655,49 @@ void flash_kernel_entry(kernel_arg_t* arg) {
 }
 
 int main() {
-  auto arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-	return vx_spawn_threads(1, arg->grid_dim, arg->block_dim, (vx_kernel_func_cb)flash_kernel_entry, arg);
+  kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
+  uint64_t t_begin = vx_rdcycle();
+  int rc = 0;
+  switch (arg->kernel_id) {
+    case KID_FLASH_FUSED:
+      // Original fused flash-online-softmax SIMT path. Uses 1D grid with
+      // blockDim.x threads per block; dispatches by head_dim/block_size_c
+      // to the templated flash_kernel_body.
+      rc = vx_spawn_threads(1, arg->grid_dim, arg->block_dim,
+                            (vx_kernel_func_cb)flash_kernel_entry, arg);
+      break;
+    case KID_QK_SIMT:
+      rc = vx_spawn_threads(2, arg->grid_dim, nullptr,
+                            (vx_kernel_func_cb)flash_qk_simt, arg);
+      break;
+    case KID_SOFTMAX:
+      rc = vx_spawn_threads(1, arg->grid_dim, nullptr,
+                            (vx_kernel_func_cb)flash_softmax_body, arg);
+      break;
+    case KID_PV_SIMT:
+      rc = vx_spawn_threads(2, arg->grid_dim, nullptr,
+                            (vx_kernel_func_cb)flash_pv_simt, arg);
+      break;
+    case KID_QK_TCU:
+      rc = vx_spawn_threads(2, arg->grid_dim, arg->block_dim,
+                            (vx_kernel_func_cb)flash_qk_tcu, arg);
+      break;
+    case KID_PV_TCU:
+      rc = vx_spawn_threads(2, arg->grid_dim, arg->block_dim,
+                            (vx_kernel_func_cb)flash_pv_tcu, arg);
+      break;
+    case KID_QK_SPARSE:
+      rc = vx_spawn_threads(2, arg->grid_dim, arg->block_dim,
+                            (vx_kernel_func_cb)flash_qk_sparse, arg);
+      break;
+    case KID_PV_SPARSE:
+      rc = vx_spawn_threads(2, arg->grid_dim, arg->block_dim,
+                            (vx_kernel_func_cb)flash_pv_sparse, arg);
+      break;
+    default:
+      return -1;
+  }
+  uint64_t t_end = vx_rdcycle();
+  arg->kernel_cycles = t_end - t_begin;
+  return rc;
 }
