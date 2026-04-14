@@ -1,0 +1,18 @@
+bench_group,shape_label,shape_params,dir_simt,dir_dense,dir_sparse,simt_cycles,dense_cycles,sparse_cycles,dense_over_simt,sparse_over_dense,combined_score,status
+attention,A1,N=32 d=512,akili_attn,akili_attn_tcu,akili_attn_tcu_sp,3783787,1236912,1201707,3.059,1.029,3.149,PASSED
+attention,A2,N=32 d=1024,akili_attn,akili_attn_tcu,akili_attn_tcu_sp,6768410,1478114,1360347,4.579,1.087,4.976,PASSED
+attention,A3,N=64 d=1024,akili_attn,akili_attn_tcu,akili_attn_tcu_sp,24999263,4526079,3797338,5.523,1.192,6.583,PASSED
+attention,A4,N=64 d=2048,akili_attn,akili_attn_tcu,akili_attn_tcu_sp,49112361,7579329,6002326,6.480,1.263,8.182,PASSED
+attention,A5,N=64 d=3072,akili_attn,akili_attn_tcu,akili_attn_tcu_sp,72895775,10273676,8318161,7.095,1.235,8.763,PASSED
+attention,A6,N=64 d=4096,akili_attn,akili_attn_tcu,akili_attn_tcu_sp,96705956,14504974,11870305,6.667,1.222,8.147,PASSED
+flash,A1,N=32 d=512,akili_flash,akili_flash_tcu,akili_flash_tcu_sp,3706387,1236912,1201707,2.996,1.029,3.084,PASSED
+flash,A2,N=32 d=1024,akili_flash,akili_flash_tcu,akili_flash_tcu_sp,6557040,1478114,1360347,4.436,1.087,4.820,PASSED
+flash,A3,N=64 d=1024,akili_flash,akili_flash_tcu,akili_flash_tcu_sp,24642428,4526079,3797338,5.445,1.192,6.489,PASSED
+flash,A4,N=64 d=2048,akili_flash,akili_flash_tcu,akili_flash_tcu_sp,48358453,7579329,6002326,6.380,1.263,8.057,PASSED
+flash,A5,N=64 d=3072,akili_flash,akili_flash_tcu,akili_flash_tcu_sp,71774104,10273676,8318161,6.986,1.235,8.629,PASSED
+flash,A6,N=64 d=4096,akili_flash,akili_flash_tcu,akili_flash_tcu_sp,95604844,14504974,11870305,6.591,1.222,8.054,PASSED
+cnn_group,C1_16x16_32_3,C_in=16 C_out=16 H=32 K=3,akili_cnn,akili_acccnn_tcu,akili_acccnn_tcu_sp,18112160,632602,544989,28.631,1.161,33.234,PASSED
+cnn_group,C2_32x32_32_3,C_in=32 C_out=32 H=32 K=3,akili_cnn,akili_acccnn_tcu,akili_acccnn_tcu_sp,67898024,2284659,1816719,29.719,1.258,37.374,PASSED
+cnn_group,C3_64x32_32_3,C_in=64 C_out=32 H=32 K=3,akili_cnn,akili_acccnn_tcu,akili_acccnn_tcu_sp,131171639,4215027,3191777,31.120,1.321,41.097,PASSED
+cnn_group,C4_32x32_32_5,C_in=32 C_out=32 H=32 K=5,akili_cnn,akili_acccnn_tcu,akili_acccnn_tcu_sp,143545932,4955634,3702043,28.966,1.339,38.775,PASSED
+cnn_group,C5_64x64_32_3,C_in=64 C_out=64 H=32 K=3,akili_cnn,akili_acccnn_tcu,akili_acccnn_tcu_sp,262882032,8442808,6390900,31.137,1.321,41.134,PASSED

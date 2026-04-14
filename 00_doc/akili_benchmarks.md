@@ -290,6 +290,121 @@ shows the dense / sparse TCU benefits most clearly. `simx` is
 cycle-approximate C++ simulation — 1 M device cycles ≈ 1 s of
 simulator wall-clock on a modern host.
 
+### Best configurations (sweet spots)
+
+#### Summary
+
+A directed sweep across 11 candidate shapes (6 attention/flash +
+5 cnn) × all three HW modes × NT=8 was run to pick a single "sweet
+spot" per benchmark group — the shape that **simultaneously**
+maximizes `dense/SIMT` and `sparse/dense`. Raw per-shape data is in
+`tests/bench_dir/bench/00_doc/sweet_spot_sweep.csv`. Sweet spots are
+chosen by combined score = `(dense/SIMT) × (sparse/dense)` so that
+neither ratio is sacrificed to the other.
+
+| Benchmark | **Sweet-spot shape** | **dense/SIMT** | **sparse/dense** | sparse/SIMT | Wall-clock (NT=8) |
+|---|---|---|---|---|---|
+| **attention** | `-n 64 -d 3072` | **7.10×** | **1.24×** | 8.76× | ~2 min |
+| **flash** | `-n 64 -d 3072` | **6.99×** | **1.24×** | 8.63× | ~2 min |
+| **cnn_group** | `-c 64 -o 64 -h 32 -w 32 -s 3` | **31.14×** | **1.32×** | 41.13× | ~9 min |
+
+Flash tracks attention exactly because at `d ≥ 32` both fall through
+to the same unfused 3-stage path and the TCU binaries run identical
+kernels.
+
+#### Candidates tested
+
+All 17 rows below come from the NT=8 sweep. Combined score =
+`dense/SIMT × sparse/dense`; the highest per group is the sweet
+spot. Every row passed correctness (the CPU fp32 reference).
+
+**Attention / FlashAttention**
+
+| Label | `-n` | `-d` | SIMT | Dense | Sparse | dense/SIMT | sparse/dense | combined |
+|---|---|---|---|---|---|---|---|---|
+| A1 | 32 |  512 |  3.78 M |  1.24 M |  1.20 M | 3.06× | 1.03× | 3.15× |
+| A2 | 32 | 1024 |  6.77 M |  1.48 M |  1.36 M | 4.58× | 1.09× | 4.98× |
+| A3 | 64 | 1024 | 25.00 M |  4.53 M |  3.80 M | 5.52× | 1.19× | 6.58× |
+| A4 | 64 | 2048 | 49.11 M |  7.58 M |  6.00 M | 6.48× | **1.26×** | 8.18× |
+| **A5** | **64** | **3072** | **72.90 M** | **10.27 M** | **8.32 M** | **7.10×** | 1.24× | **8.76×** |
+| A6 | 64 | 4096 | 96.71 M | 14.50 M | 11.87 M | 6.67× | 1.22× | 8.15× |
+
+Flash numbers are within noise of attention at every row (at `d ≥ 32`
+both run the same unfused 3-stage path on SIMT and identical TCU
+kernels). See `sweet_spot_sweep.csv` for the flash rows separately.
+
+**CNN / conv2d**
+
+| Label | `-c C_in` | `-o C_out` | `-h H` | `-s K` | SIMT | Dense | Sparse | dense/SIMT | sparse/dense | combined |
+|---|---|---|---|---|---|---|---|---|---|---|
+| C1 | 16 | 16 | 32 | 3 |  18.11 M |  632.6 k |  545.0 k | 28.63× | 1.16× | 33.23× |
+| C2 | 32 | 32 | 32 | 3 |  67.90 M |   2.28 M |   1.82 M | 29.72× | 1.26× | 37.37× |
+| C3 | 64 | 32 | 32 | 3 | 131.17 M |   4.22 M |   3.19 M | **31.12×** | **1.32×** | 41.10× |
+| C4 | 32 | 32 | 32 | **5** | 143.55 M |   4.96 M |   3.70 M | 28.97× | **1.34×** | 38.77× |
+| **C5** | **64** | **64** | **32** | **3** | **262.88 M** |   **8.44 M** |   **6.39 M** | **31.14×** | **1.32×** | **41.13×** |
+
+#### Trends observed during the sweep
+
+- **Attention/flash dense/SIMT peaks at `d=3072`** (7.10×) and dips
+  back at `d=4096` (6.67×). The A6 regression is ~6% relative to A5
+  and repeats across attention and flash, so it isn't noise — most
+  likely an L1/L2 cache pressure or TLB effect that shows up once
+  both Q and K_col buffers exceed a certain threshold.
+- **Attention/flash sparse/dense peaks at `d=2048` (1.263×), not
+  at the dense/SIMT peak `d=3072` (1.235×).** If your demo is
+  *specifically* about sparse speedup and you don't care about
+  dense/SIMT, pick A4 (`-n 64 -d 2048`) instead of A5.
+- **CNN dense/SIMT saturates near 31×** — going from `C_in=32`
+  (C2) to `C_in=64` (C3/C5) barely nudges the ratio (29.72×
+  → 31.1×). The TCU is already fully utilized at C2; the only
+  remaining lever is sparse compression.
+- **C4 (`-s 5` kernel) wins on sparse/dense alone (1.339×) —
+  the strongest sparse ratio in the entire sweep**. Bigger kernel
+  size inflates `K_gemm` from 288 (C2) to 800, amortizing sparse
+  metadata overhead further. But dense/SIMT drops from 29.7× to
+  29.0×, so C4 loses to C3/C5 on combined score. C4 is the pick if
+  your demo is *sparse-only*.
+- **C3 and C5 tie on combined score (~41.1×)** — C3 is the
+  half-wall-clock alternative (SIMT ~4-5 min vs C5's ~9 min) at
+  effectively identical ratios. Use C3 when you're iterating, C5
+  for the headline numbers.
+
+#### Best option per benchmark
+
+Use these three commands together for a single balanced demo:
+
+```bash
+BENCH=tests/bench_dir/bench/benchmarks
+export VORTEX_DRIVER=simx LD_LIBRARY_PATH=<build>/runtime
+
+# Attention sweet spot (~2 min, dense/SIMT=7.10×, sparse/dense=1.24×)
+(cd $BENCH/akili_attn         && ./akili_attn         -n 64 -d 3072)
+(cd $BENCH/akili_attn_tcu     && ./akili_attn_tcu     -n 64 -d 3072)
+(cd $BENCH/akili_attn_tcu_sp  && ./akili_attn_tcu_sp  -n 64 -d 3072)
+
+# Flash sweet spot (same shape; dense/SIMT=6.99×, sparse/dense=1.24×)
+(cd $BENCH/akili_flash         && ./akili_flash         -n 64 -d 3072)
+(cd $BENCH/akili_flash_tcu     && ./akili_flash_tcu     -n 64 -d 3072)
+(cd $BENCH/akili_flash_tcu_sp  && ./akili_flash_tcu_sp  -n 64 -d 3072)
+
+# CNN sweet spot (~9 min, dense/SIMT=31.14×, sparse/dense=1.32×)
+(cd $BENCH/akili_cnn            && ./akili_cnn            -c 64 -o 64 -h 32 -w 32 -s 3)
+(cd $BENCH/akili_acccnn_tcu     && ./akili_acccnn_tcu     -c 64 -o 64 -h 32 -w 32 -s 3)
+(cd $BENCH/akili_acccnn_tcu_sp  && ./akili_acccnn_tcu_sp  -c 64 -o 64 -h 32 -w 32 -s 3)
+```
+
+If you care only about one metric rather than the combined score:
+
+| Priority | Recommendation |
+|---|---|
+| Max dense/SIMT (attn/flash) | A5 — `-n 64 -d 3072` (7.10×) |
+| Max sparse/dense (attn/flash) | A4 — `-n 64 -d 2048` (1.263×) |
+| Max dense/SIMT (cnn)   | C5 — `-c 64 -o 64 -h 32 -s 3` (31.14×) |
+| Max sparse/dense (cnn) | C4 — `-c 32 -o 32 -h 32 -s 5` (1.339×) |
+| Fastest CNN demo with strong ratios | C3 — `-c 64 -o 32 -h 32 -s 3` (31.12× / 1.32×, ~half C5's wall-clock) |
+
+---
+
 ### Attention and FlashAttention — dense TCU wins (all three modes valid)
 
 | Purpose | Shape | Why | ~Wall-clock (NT=8) |
@@ -387,6 +502,7 @@ to test very large C_in.
 | File | Purpose |
 |---|---|
 | `tests/bench_dir/bench/00_doc/speedup_results_akili.csv` | Machine-readable version of Section 5's speedup tables (12 rows, one per (bench_group, shape_label)). |
+| `tests/bench_dir/bench/00_doc/sweet_spot_sweep.csv` | Raw per-shape data for the Section 7 "Best configurations" sweep (17 rows: 6 attention + 6 flash + 5 cnn). Columns include cycles + ratios + combined score. |
 | `tests/bench_dir/bench/00_doc/benchmark_status.md`       | Per-benchmark implementation history, build-config tables, and an end-to-end regression sanity-check script. |
 | `tests/regression/sgemm/`                                | Reference SIMT GEMM test — the akili_cnn / akili_attn dispatch patterns are modeled on it. |
 | `tests/regression/sgemm_tcu/`                            | Reference dense TCU GEMM. The akili_*_tcu TCU kernels are direct copies. |
