@@ -1,17 +1,17 @@
-#include <vx_spawn.h>
+#include <vx_spawn2.h>
 #include <vx_intrinsics.h>
 #include "common.h"
 #include <cmath>
 #include <algorithm>
 
 // =============================================================================
-// SIMT attention kernels.
-//   kernel0_body  : S[i,j] = sum_k Q[i,k] * K[k,j]      — one thread per (i,j)
-//   kernel1_body  : P = softmax(S) row-wise             — one thread per row
-//   kernel2_body  : O[i,j] = sum_k P[i,k] * V[k,j]      — one thread per (i,j)
+// SIMT attention kernels (KMU-dispatched).
+//   qk_body       : S[i,j] = sum_k Q[i,k] * K[k,j]      — one block per (i,j)
+//   softmax_body  : P = softmax(S) row-wise             — striped hw-thread pattern
+//   pv_body       : O[i,j] = sum_k P[i,k] * V[k,j]      — one block per (i,j)
 // =============================================================================
 
-void kernel0_body(kernel_arg_t* __UNIFORM__ arg) {
+static void qk_body(kernel_arg_t* __UNIFORM__ arg) {
   auto Q = reinterpret_cast<TYPE*>(arg->Q_addr);
   auto K = reinterpret_cast<TYPE*>(arg->K_addr);
   auto S = reinterpret_cast<TYPE*>(arg->S_addr);
@@ -29,31 +29,34 @@ void kernel0_body(kernel_arg_t* __UNIFORM__ arg) {
   S[row * N + col] = sum;
 }
 
-void kernel1_body(kernel_arg_t* __UNIFORM__ arg) {
+static void softmax_body(kernel_arg_t* __UNIFORM__ arg) {
   auto S = reinterpret_cast<TYPE*>(arg->S_addr);
   auto P = reinterpret_cast<TYPE*>(arg->P_addr);
-  auto N = arg->N;
+  uint32_t N = arg->N;
 
-  int row = blockIdx.x;
+  uint32_t hw_tid = blockIdx.x * NUM_THREADS + threadIdx.x;
+  uint32_t stride = gridDim.x * NUM_THREADS;
 
-  TYPE max_val = S[row * N];
-  for (uint32_t col = 1; col < N; ++col) {
-    max_val = std::max(max_val, S[row * N + col]);
-  }
+  for (uint32_t row = hw_tid; row < N; row += stride) {
+    TYPE max_val = S[row * N];
+    for (uint32_t col = 1; col < N; ++col) {
+      max_val = std::max(max_val, S[row * N + col]);
+    }
 
-  TYPE local_P[512];
-  TYPE exp_sum = 0;
-  for (uint32_t col = 0; col < N; ++col) {
-    auto exp = std::exp(S[row * N + col] - max_val);
-    local_P[col] = exp;
-    exp_sum += exp;
-  }
-  for (uint32_t col = 0; col < N; ++col) {
-    P[row * N + col] = local_P[col] / exp_sum;
+    TYPE local_P[512];
+    TYPE exp_sum = 0;
+    for (uint32_t col = 0; col < N; ++col) {
+      auto e = std::exp(S[row * N + col] - max_val);
+      local_P[col] = e;
+      exp_sum += e;
+    }
+    for (uint32_t col = 0; col < N; ++col) {
+      P[row * N + col] = local_P[col] / exp_sum;
+    }
   }
 }
 
-void kernel2_body(kernel_arg_t* __UNIFORM__ arg) {
+static void pv_body(kernel_arg_t* __UNIFORM__ arg) {
   auto P = reinterpret_cast<TYPE*>(arg->P_addr);
   auto V = reinterpret_cast<TYPE*>(arg->V_addr);
   auto O = reinterpret_cast<TYPE*>(arg->O_addr);
@@ -72,32 +75,13 @@ void kernel2_body(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Entry point — wraps each spawn in rdcycle timing.
+// Single entry point — host selects the active stage via arg->kernel_id.
 // =============================================================================
-int main() {
-  kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-
-  uint64_t t_begin = vx_rdcycle();
-  int rc = 0;
-
+__kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   switch (arg->kernel_id) {
-    case KID_QK_SIMT:
-      rc = vx_spawn_threads(2, arg->grid_dim, nullptr,
-                            (vx_kernel_func_cb)kernel0_body, arg);
-      break;
-    case KID_SOFTMAX:
-      rc = vx_spawn_threads(1, arg->grid_dim, nullptr,
-                            (vx_kernel_func_cb)kernel1_body, arg);
-      break;
-    case KID_PV_SIMT:
-      rc = vx_spawn_threads(2, arg->grid_dim, nullptr,
-                            (vx_kernel_func_cb)kernel2_body, arg);
-      break;
-    default:
-      return -1;
+    case KID_QK_SIMT: qk_body(arg);      break;
+    case KID_SOFTMAX: softmax_body(arg); break;
+    case KID_PV_SIMT: pv_body(arg);      break;
+    default: break;
   }
-
-  uint64_t t_end = vx_rdcycle();
-  arg->kernel_cycles = t_end - t_begin;
-  return rc;
 }

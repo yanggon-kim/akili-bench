@@ -31,11 +31,6 @@ void vx_init() {
     RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_CORES, &num_cores));
     RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_WARPS, &num_warps));
     RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_THREADS, &num_threads));
-    if (num_threads != NUM_THREADS) {
-        std::cerr << "Kernel expects NUM_THREADS=" << NUM_THREADS
-                  << ", but device reports " << num_threads << std::endl;
-        exit(-1);
-    }
     num_total_threads = num_cores * num_warps * num_threads;
 }
 
@@ -96,9 +91,10 @@ void vx_matmul_optimized(float* C, float* A, float* B, int M, int N, int K) {
     matmul_kernel_arg.N = N;
     matmul_kernel_arg.K = K;
 
-    matmul_kernel_arg.block_dim[0] = NUM_THREADS;
-    matmul_kernel_arg.block_dim[1] = 1;
-    matmul_kernel_arg.grid_dim[0] = (M + NUM_THREADS - 1) / NUM_THREADS;
+    const uint32_t BLOCK_SIZE = 4;
+    matmul_kernel_arg.block_dim[0] = BLOCK_SIZE;
+    matmul_kernel_arg.block_dim[1] = (N == 1) ? 1 : BLOCK_SIZE;
+    matmul_kernel_arg.grid_dim[0] = (M + BLOCK_SIZE - 1) / BLOCK_SIZE;
     matmul_kernel_arg.grid_dim[1] = (N + matmul_kernel_arg.block_dim[1] - 1) / matmul_kernel_arg.block_dim[1];
 
     // Allocate or reuse buffer A (only if size changed)
@@ -142,9 +138,11 @@ void vx_matmul_optimized(float* C, float* A, float* B, int M, int N, int K) {
     RT_CHECK(vx_copy_to_dev(matmul_B_buffer, B, 0, B_sz));
     RT_CHECK(vx_copy_to_dev(matmul_args_buffer, &matmul_kernel_arg, 0, sizeof(matmul_kernel_args_t)));
 
-    // Execute kernel
+    // Execute kernel via KMU
+    uint32_t grid_dim[2]  = { matmul_kernel_arg.grid_dim[0],  matmul_kernel_arg.grid_dim[1]  };
+    uint32_t block_dim[2] = { matmul_kernel_arg.block_dim[0], matmul_kernel_arg.block_dim[1] };
     RT_CHECK(vx_start_g(device, matmul_krnl_buffer, matmul_args_buffer, 2,
-                         matmul_kernel_arg.grid_dim, matmul_kernel_arg.block_dim, 0));
+                        grid_dim, block_dim, /*smem_size=*/0));
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
     // Download result

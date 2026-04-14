@@ -1,12 +1,13 @@
-#include <vx_spawn.h>
+#include <vx_spawn2.h>
 #include <vx_intrinsics.h>
 #include "common.h"
 
 // =============================================================================
 // akili_cnn — SIMT 2D convolution. One thread per output element.
 // grid = {H_out*W_out, C_out}. Each thread loops over C_in × K × K.
+// KMU-dispatched per-CTA via vx_start_g.
 // =============================================================================
-void kernel_conv_simt(kernel_arg_t* __UNIFORM__ arg) {
+__kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   auto I = reinterpret_cast<float*>(arg->I_addr);
   auto W = reinterpret_cast<float*>(arg->W_addr);
   auto O = reinterpret_cast<float*>(arg->O_addr);
@@ -41,14 +42,4 @@ void kernel_conv_simt(kernel_arg_t* __UNIFORM__ arg) {
     }
   }
   O[oc * H_out * W_out + oy * W_out + ox] = sum;
-}
-
-int main() {
-  kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-  uint64_t t_begin = vx_rdcycle();
-  int rc = vx_spawn_threads(2, arg->grid_dim, nullptr,
-                            (vx_kernel_func_cb)kernel_conv_simt, arg);
-  uint64_t t_end = vx_rdcycle();
-  arg->kernel_cycles = t_end - t_begin;
-  return rc;
 }

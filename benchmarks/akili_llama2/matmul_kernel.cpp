@@ -1,7 +1,12 @@
-#include <vx_spawn.h>
+#include <vx_spawn2.h>
 #include "common.h"
 
-static void matmul_kernel_(matmul_kernel_args_t* __UNIFORM__ args) {
+// =============================================================================
+// akili_llama2 matmul — plain SIMT GEMM. One block covers a BLOCK_SIZE × BLOCK_SIZE
+// tile of C; threads within the block stripe across rows and columns via
+// blockIdx/blockDim/threadIdx as provided by the KMU. KMU-dispatched via vx_start_g.
+// =============================================================================
+__kernel void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
     auto A = reinterpret_cast<float*>(args->A_addr);
     auto B = reinterpret_cast<float*>(args->B_addr);
     auto C = reinterpret_cast<float*>(args->C_addr);
@@ -21,10 +26,4 @@ static void matmul_kernel_(matmul_kernel_args_t* __UNIFORM__ args) {
         }
         C[row * N + col] = sum;
     }
-}
-
-int main() {
-    auto arg = (matmul_kernel_args_t*)csr_read(VX_CSR_MSCRATCH);
-    return vx_spawn_threads(2, arg->grid_dim, arg->block_dim,
-                            (vx_kernel_func_cb)matmul_kernel_, arg);
 }

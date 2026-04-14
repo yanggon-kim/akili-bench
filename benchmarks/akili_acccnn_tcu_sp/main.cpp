@@ -235,13 +235,6 @@ void cleanup() {
   }
 }
 
-static void read_back_cycles() {
-  kernel_arg_t back = {};
-  vx_copy_from_dev(&back, args_buffer, 0, sizeof(kernel_arg_t));
-  printf("KCYC[CONV,nt=%u]: %lu\n",
-         (unsigned)NUM_THREADS, (unsigned long)back.kernel_cycles);
-}
-
 int main(int argc, char* argv[]) {
   parse_args(argc, argv);
   std::srand(50);
@@ -355,9 +348,11 @@ int main(int argc, char* argv[]) {
   kernel_arg.block_dim[0] = NUM_THREADS;
   kernel_arg.block_dim[1] = 1;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+
+  uint32_t grid_dim[2]  = {N_gemm / TN, M_gemm / TM};
+  uint32_t block_dim[2] = {NUM_THREADS, 1};
+  RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles();
 
   std::vector<float> h_O_gemm((size_t)M_gemm * N_gemm, 0.0f);
   RT_CHECK(vx_copy_from_dev(h_O_gemm.data(), O_buffer, 0, O_bytes));

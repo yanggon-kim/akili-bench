@@ -228,13 +228,6 @@ void cleanup() {
   }
 }
 
-static void read_back_cycles(const char* stage_tag) {
-  kernel_arg_t back = {};
-  vx_copy_from_dev(&back, args_buffer, 0, sizeof(kernel_arg_t));
-  printf("KCYC[%s,nt=%u]: %lu\n",
-         stage_tag, (unsigned)NUM_THREADS, (unsigned long)back.kernel_cycles);
-}
-
 int main(int argc, char* argv[]) {
   parse_args(argc, argv);
   std::srand(50);
@@ -347,15 +340,14 @@ int main(int argc, char* argv[]) {
 
   // ---------------- Stage 1: sparse QK ----------------
   std::cout << "=== Stage 1: S = Q @ K^T (sparse TCU) ===" << std::endl;
-  kernel_arg.grid_dim[0]  = N / TN;
-  kernel_arg.grid_dim[1]  = N / TM;
-  kernel_arg.block_dim[0] = NUM_THREADS;
-  kernel_arg.block_dim[1] = 1;
-  kernel_arg.kernel_id    = KID_QK_SPARSE;
+  kernel_arg.kernel_id = KID_QK_SPARSE;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
-  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("QK");
+  {
+    uint32_t grid_dim[2]  = {N / TN, N / TM};
+    uint32_t block_dim[2] = {NUM_THREADS, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
+    RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+  }
 
   std::vector<float> h_S(N * N, 0.0f);
   RT_CHECK(vx_copy_from_dev(h_S.data(), S_buffer, 0, s_fp32_bytes));
@@ -381,14 +373,16 @@ int main(int argc, char* argv[]) {
 
   // ---------------- Stage 2: SIMT softmax ----------------
   std::cout << "=== Stage 2: P = softmax(S) ===" << std::endl;
-  kernel_arg.P_addr      = P_fp32_addr;
-  kernel_arg.grid_dim[0] = N;
-  kernel_arg.grid_dim[1] = 1;
-  kernel_arg.kernel_id   = KID_SOFTMAX;
+  kernel_arg.P_addr    = P_fp32_addr;
+  kernel_arg.kernel_id = KID_SOFTMAX;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
-  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("SM");
+  {
+    // 8 CTAs × NUM_THREADS threads striped across N rows — matches DXA variant.
+    uint32_t grid_dim[2]  = {8, 1};
+    uint32_t block_dim[2] = {NUM_THREADS, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
+    RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+  }
 
   std::vector<float> h_P(N * N);
   RT_CHECK(vx_copy_from_dev(h_P.data(), P_fp32_buf, 0, s_fp32_bytes));
@@ -432,16 +426,15 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_copy_to_dev(meta_P_buf,  h_meta_P.data(),        0,
                           (uint32_t)h_meta_P.size() * sizeof(uint32_t)));
 
-  kernel_arg.P_addr      = P_sp_addr;
-  kernel_arg.grid_dim[0] = d / TN;
-  kernel_arg.grid_dim[1] = N / TM;
-  kernel_arg.block_dim[0] = NUM_THREADS;
-  kernel_arg.block_dim[1] = 1;
-  kernel_arg.kernel_id   = KID_PV_SPARSE;
+  kernel_arg.P_addr    = P_sp_addr;
+  kernel_arg.kernel_id = KID_PV_SPARSE;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
-  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("PV");
+  {
+    uint32_t grid_dim[2]  = {d / TN, N / TM};
+    uint32_t block_dim[2] = {NUM_THREADS, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
+    RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+  }
 
   std::vector<float> h_O(N * d);
   RT_CHECK(vx_copy_from_dev(h_O.data(), O_buffer, 0, out_bytes));

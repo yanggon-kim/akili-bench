@@ -1,11 +1,11 @@
-#include <vx_spawn.h>
+#include <vx_spawn2.h>
 #include <vx_tensor.h>
 #include "common.h"
 
 namespace vt = vortex::tensor;
 using ctx = vt::wmma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
 
-static void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
+extern "C" void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
     auto A = reinterpret_cast<ctx::input_t*>(args->A_addr);
     auto B = reinterpret_cast<ctx::input_t*>(args->B_addr);
     auto C = reinterpret_cast<ctx::output_t*>(args->C_addr);
@@ -30,12 +30,4 @@ static void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
 
     auto tileC = C + tile_row * args->N + tile_col;
     ctx::store_matrix_sync(tileC, fragC, args->N);
-}
-
-int main() {
-    auto arg = (matmul_kernel_args_t*)csr_read(VX_CSR_MSCRATCH);
-    uint32_t grid_dim[2] = {arg->N / ctx::tileN, arg->M / ctx::tileM};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
-    return vx_spawn_threads(2, grid_dim, block_dim,
-                            (vx_kernel_func_cb)kernel_main, arg);
 }

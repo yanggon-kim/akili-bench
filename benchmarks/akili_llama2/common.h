@@ -1,9 +1,5 @@
 #pragma once
 
-#ifndef NUM_THREADS
-#define NUM_THREADS 4
-#endif
-
 struct matmul_kernel_args_t {
     uint32_t grid_dim[2];
     uint32_t block_dim[2];
@@ -14,4 +10,5 @@ struct matmul_kernel_args_t {
     int N;
     int K;
 };
+
 

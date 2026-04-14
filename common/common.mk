@@ -54,7 +54,16 @@ VX_CFLAGS += $(CONFIGS)
 VX_LIBS += -L$(LIBC_VORTEX)/lib -lm -lc
 VX_LIBS += $(LIBCRT_VORTEX)/lib/baremetal/libclang_rt.builtins-riscv$(XLEN).a
 
-VX_LDFLAGS += -Wl,-Bstatic,--gc-sections,-T,$(VORTEX_HOME)/kernel/scripts/link$(XLEN).ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR) $(VORTEX_KN_PATH)/libvortex.a $(VX_LIBS)
+# KERNEL_LIB selects which Vortex kernel library to link against:
+#   vortex  (default): classic int-main + vx_spawn_threads flow
+#   vortex2: new __kernel + vx_start_g flow (supports vx_spawn2.h / __local_mem())
+KERNEL_LIB ?= vortex
+VX_KMU_FLAG := $(if $(filter vortex2,$(KERNEL_LIB)),-DKMU_ENABLE)
+VX_STARTUP_SRC := $(VORTEX_HOME)/kernel/src/vx_start.S
+KERNEL_STARTUP := $(VORTEX_HOME)/kernel/scripts/kernel_startup.sh
+VX_APP_OBJS = $(addsuffix .o, $(basename $(notdir $(VX_SRCS))))
+
+VX_LDFLAGS += -Wl,-Bstatic,--gc-sections,-T,$(VORTEX_HOME)/kernel/scripts/link$(XLEN).ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR) $(VORTEX_KN_PATH)/lib$(KERNEL_LIB).a $(VX_LIBS)
 
 CXXFLAGS += -std=c++17 -Wall -Wextra -pedantic -Wfatal-errors
 CXXFLAGS += -I$(VORTEX_HOME)/runtime/include -I$(VORTEX_BUILD)/hw -I$(SW_COMMON_DIR)
@@ -90,8 +99,23 @@ kernel.dump: kernel.elf
 kernel.vxbin: kernel.elf
 	OBJCOPY=$(VX_CP) $(VORTEX_HOME)/kernel/scripts/vxbin.py $< $@
 
+ifeq ($(KERNEL_LIB),vortex2)
+# vortex2 flow: compile each app source, then build startup object using
+# kernel_startup.sh (which embeds the kernel_main symbol address).
+%.o: %.cpp
+	$(VX_CXX) $(VX_CFLAGS) -c $< -o $@
+
+vx_start.o: $(VX_STARTUP_SRC) $(VX_APP_OBJS)
+	$(VX_CXX) $(VX_CFLAGS) -DNEED_GP -DNEED_TLS -DNEED_INITFINI $(VX_KMU_FLAG) -c $(VX_STARTUP_SRC) -o $@
+	$(VX_CXX) $(VX_CFLAGS) $@ $(VX_APP_OBJS) $(VX_LDFLAGS) -o $@.elf
+	$(VX_CXX) $(VX_CFLAGS) $$($(KERNEL_STARTUP) $(VX_DP) $@.elf) $(VX_KMU_FLAG) -c $(VX_STARTUP_SRC) -o $@ && rm -f $@.elf
+
+kernel.elf: vx_start.o $(VX_APP_OBJS)
+	$(VX_CXX) $(VX_CFLAGS) $^ $(VX_LDFLAGS) -o kernel.elf
+else
 kernel.elf: $(VX_SRCS)
 	$(VX_CXX) $(VX_CFLAGS) $^ $(VX_LDFLAGS) -o kernel.elf
+endif
 
 $(PROJECT): $(SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@

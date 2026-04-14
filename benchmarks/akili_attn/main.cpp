@@ -6,8 +6,6 @@
 //   Stage 3: O = P · V         (kernel2_body)
 //
 // Verification: compare each stage output against a host fp32 reference.
-// Prints per-stage cycle counts via the kernel_cycles field written by the
-// device main() using vx_rdcycle() bracket.
 
 #include <iostream>
 #include <unistd.h>
@@ -121,13 +119,6 @@ void cleanup() {
   }
 }
 
-static void read_back_cycles(const char* stage_tag) {
-  kernel_arg_t back = {};
-  vx_copy_from_dev(&back, args_buffer, 0, sizeof(kernel_arg_t));
-  printf("KCYC[%s,nt=%u]: %lu\n",
-         stage_tag, (unsigned)NUM_THREADS, (unsigned long)back.kernel_cycles);
-}
-
 int main(int argc, char* argv[]) {
   parse_args(argc, argv);
   std::srand(50);
@@ -192,13 +183,16 @@ int main(int argc, char* argv[]) {
   std::cout << "=== Stage 1: S = Q @ K^T ===" << std::endl;
   kernel_arg.grid_dim[0] = N;
   kernel_arg.grid_dim[1] = N;
-  kernel_arg.block_dim[0] = 0;
-  kernel_arg.block_dim[1] = 0;
+  kernel_arg.block_dim[0] = NUM_THREADS;
+  kernel_arg.block_dim[1] = 1;
   kernel_arg.kernel_id = KID_QK_SIMT;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
-  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("QK");
+  {
+    uint32_t grid_dim[2]  = {N, N};
+    uint32_t block_dim[2] = {NUM_THREADS, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
+    RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+  }
 
   std::vector<float> h_S(N * N);
   RT_CHECK(vx_copy_from_dev(h_S.data(), S_buffer, 0, s_bytes));
@@ -216,13 +210,19 @@ int main(int argc, char* argv[]) {
 
   // ---------------- Stage 2: P = softmax(S) ----------------
   std::cout << "=== Stage 2: P = softmax(S) ===" << std::endl;
-  kernel_arg.grid_dim[0] = N;
+  kernel_arg.grid_dim[0] = 8;
   kernel_arg.grid_dim[1] = 1;
+  kernel_arg.block_dim[0] = NUM_THREADS;
+  kernel_arg.block_dim[1] = 1;
   kernel_arg.kernel_id = KID_SOFTMAX;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
-  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("SM");
+  {
+    // 8 CTAs × NUM_THREADS threads striped across N rows.
+    uint32_t grid_dim[2]  = {8, 1};
+    uint32_t block_dim[2] = {NUM_THREADS, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
+    RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+  }
 
   std::vector<float> h_P(N * N);
   RT_CHECK(vx_copy_from_dev(h_P.data(), P_buffer, 0, s_bytes));
@@ -242,11 +242,16 @@ int main(int argc, char* argv[]) {
   std::cout << "=== Stage 3: O = P @ V ===" << std::endl;
   kernel_arg.grid_dim[0] = d;
   kernel_arg.grid_dim[1] = N;
+  kernel_arg.block_dim[0] = NUM_THREADS;
+  kernel_arg.block_dim[1] = 1;
   kernel_arg.kernel_id = KID_PV_SIMT;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
-  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("PV");
+  {
+    uint32_t grid_dim[2]  = {d, N};
+    uint32_t block_dim[2] = {NUM_THREADS, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
+    RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+  }
 
   std::vector<float> h_O(N * d);
   RT_CHECK(vx_copy_from_dev(h_O.data(), O_buffer, 0, out_bytes));

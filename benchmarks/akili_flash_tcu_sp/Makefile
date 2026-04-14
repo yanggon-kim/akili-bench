@@ -14,6 +14,8 @@ CONFIGS ?= -DNUM_THREADS=$(NUM_THREADS) -DNUM_TCU_LANES=$(NUM_TCU_LANES) \
 SRCS    := main.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp
 VX_SRCS := kernel.cpp
 
+KERNEL_LIB := vortex2
+
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
 LDFLAGS  += $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
 
