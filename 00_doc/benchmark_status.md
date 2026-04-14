@@ -57,7 +57,7 @@ removed — they remain for history and cross-checking.
 ### Build state assumed
 
 ```bash
-cd vortex_sparse_tc/build
+cd vortex/build
 source ./ci/toolchain_env.sh               # set TOOLDIR + PATH
 
 # Pick a warp width (4, 8, 16, 32) and build simx + runtime for it:
@@ -68,7 +68,7 @@ All runs below require:
 
 ```bash
 export VORTEX_DRIVER=simx
-export LD_LIBRARY_PATH=<absolute path to vortex_sparse_tc/build>/runtime
+export LD_LIBRARY_PATH=<absolute path to vortex/build>/runtime
 ```
 
 ### Attention trio
@@ -291,7 +291,7 @@ sparse bonus and 28-30× dense-over-SIMT speedup.
 ## 6. Verification sanity checks (run after any edit)
 
 ```bash
-cd vortex_sparse_tc/build
+cd vortex/build
 /tmp/rebuild_nt.sh 8
 export VORTEX_DRIVER=simx LD_LIBRARY_PATH=$PWD/runtime
 

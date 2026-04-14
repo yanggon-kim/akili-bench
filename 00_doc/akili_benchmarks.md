@@ -9,7 +9,7 @@ SIMT mode, dense TCU mode, or 2:4 sparse TCU mode — and compare the
 three against each other head-to-head at a shape of your choice.
 
 All paths in this document are **relative to the Vortex source root**
-(`vortex_sparse_tc/`). No absolute paths, so everything works from
+(`vortex/`). No absolute paths, so everything works from
 any clone.
 
 ---
@@ -53,7 +53,7 @@ against a fp32 CPU reference.
 From the Vortex source root:
 
 ```bash
-cd vortex_sparse_tc
+cd vortex
 mkdir -p build && cd build
 ../configure --xlen=32 --tooldir=$HOME/tools
 ./ci/toolchain_install.sh --all         # first time only
@@ -64,7 +64,7 @@ make -s                                  # full build, one-time
 ### 2.2 Per-shell environment
 
 ```bash
-cd vortex_sparse_tc/build
+cd vortex/build
 source ./ci/toolchain_env.sh
 export VORTEX_DRIVER=simx
 export LD_LIBRARY_PATH=$PWD/runtime:$LD_LIBRARY_PATH
@@ -78,7 +78,7 @@ all 9 akili_* benchmarks because `TCU_SPARSE_ENABLE` also turns on
 the dense-TCU path:
 
 ```bash
-# From vortex_sparse_tc/build:
+# From vortex/build:
 CONFIGS="-DNUM_THREADS=8 -DEXT_TCU_ENABLE -DTCU_SPARSE_ENABLE" \
   make -C sim/simx clean && \
 CONFIGS="-DNUM_THREADS=8 -DEXT_TCU_ENABLE -DTCU_SPARSE_ENABLE" \
@@ -263,7 +263,7 @@ To reproduce any single row of the speedup table, build the matching
 three binaries and run each one at the same CLI:
 
 ```bash
-cd vortex_sparse_tc
+cd vortex
 # Example: reproduce the attention XL row (N=64, d=512) at NT=8
 BENCH=tests/bench_dir/bench/benchmarks
 for d in akili_attn akili_attn_tcu akili_attn_tcu_sp; do
