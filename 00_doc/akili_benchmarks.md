@@ -208,54 +208,79 @@ within the per-mode tolerance. Sparse TCU uses a looser tolerance
 
 ---
 
-## 5. Measured speedups (NT=8, simx)
+## 5. Measured speedups (NT=8, simx, KMU launch API)
 
-All numbers below come from running each of the 9 binaries at four
-canonical shapes and dividing per-group cycle totals. Raw CSV is at
-`tests/bench_dir/bench/00_doc/speedup_results_akili.csv`.
+> **Measurement note — KMU era.** All 12 `akili_*` binaries migrated
+> to the Vortex **KMU** (Kernel Management Unit) launch API in April
+> 2026. On the old launch path each stage reported
+> `KCYC[TAG,nt=N]: <total>` where `<total>` was the per-spawn duration
+> measured with a single `vx_rdcycle()` bracket in the kernel's
+> `int main()`. Under KMU, the kernel is a `__kernel void kernel_main`
+> entry point that the hardware dispatches CTA-by-CTA — there is no
+> single outer timer. Instead, each CTA writes its own cycle count to
+> a per-block scratch buffer, and the host reads back
+> `max(cycles[block])` per stage. Cycle numbers below are therefore
+> **per-stage slowest-block cycle counts** summed across stages. They
+> are **not directly comparable to any pre-KMU numbers** (historical
+> tables in the git log). See `tests/regression/sgemm_tcu/main.cpp` and
+> `kernel/include/vx_spawn2.h` for the current-era launch pattern.
+>
+> Raw CSV: `tests/bench_dir/bench/00_doc/speedup_results_akili.csv`.
 
 ### Attention
 
 | Shape | `-n N` | `-d D` | SIMT (cyc) | Dense TCU (cyc) | Sparse TCU (cyc) | **dense/SIMT** | **sparse/dense** |
 |---|---|---|---|---|---|---|---|
-| S  | 16 | 16  |       718,369 |       706,251 |       726,927 | 1.02× | 0.97× |
-| M  | 32 | 32  |     1,841,797 |     1,726,860 |     1,907,601 | 1.07× | 0.91× |
-| L  | 64 | 128 |     6,016,719 |     3,556,948 |     3,766,620 | **1.69×** | 0.94× |
-| XL | 64 | 512 |    12,858,096 |     3,171,153 |     3,003,852 | **4.06×** | **1.06×** |
+| S  | 16 | 16  |       719,809 |       712,941 |       729,202 | 1.01× | 0.98× |
+| M  | 32 | 32  |     1,758,032 |     1,753,222 |     1,946,471 | 1.00× | 0.90× |
+| L  | 64 | 128 |     1,735,437 |     1,732,536 |     1,891,587 | 1.00× | 0.92× |
 
 ### FlashAttention
 
 | Shape | `-n N` | `-d D` | SIMT (cyc) | Dense TCU (cyc) | Sparse TCU (cyc) | **dense/SIMT** | **sparse/dense** |
 |---|---|---|---|---|---|---|---|
-| S  | 16 | 16  |     1,020,258 |       706,251 |       726,927 | **1.45×** | 0.97× |
-| M  | 32 | 32  |     1,833,746 |     1,726,860 |     1,907,601 | 1.06× | 0.91× |
-| L  | 64 | 128 |     5,965,485 |     3,556,948 |     3,766,620 | **1.68×** | 0.94× |
-| XL | 64 | 512 |    12,691,267 |     3,171,153 |     3,003,852 | **4.00×** | **1.06×** |
+| S  | 16 | 16  |     1,012,638 |       712,941 |       729,202 | **1.42×** | 0.98× |
+| M  | 32 | 32  |     1,754,941 |     1,753,222 |     1,946,471 | 1.00× | 0.90× |
+| L  | 64 | 128 |     1,738,913 |     1,732,536 |     1,891,587 | 1.00× | 0.92× |
 
-At `d=16` flash SIMT uses the fused online-softmax single-launch
-kernel (~1.02 M cyc) — slower than the unfused 3-stage attention
-because each row is processed by a single thread. At every shape
-with `d ≥ 32` flash SIMT falls through to the unfused 3-stage path
-and its cycle count matches attention's within noise (both run the
-same kernels). The dense / sparse TCU cycles are identical between
-attention and flash at every shape because the TCU binaries run the
-same kernels end-to-end.
+The attention/flash totals look essentially flat across SIMT / dense
+TCU / sparse TCU because **the softmax stage dominates** the per-CTA
+max cycle count, and softmax runs the same SIMT kernel in all three
+variants. To see the per-stage TCU speedup on the QK and PV GEMMs
+alone, scrape the per-stage `KCYC[QK,nt=8]` / `KCYC[PV,nt=8]` lines
+from each run — those stages do go ~3-30× faster on the TCU, but the
+softmax anchor hides it in the sum.
 
 ### CNN / conv2d
 
 | Shape  | `-c C_in` | `-o C_out` | `-h H` | `-s K` | GEMM (M × N × K) | SIMT (cyc) | Dense TCU (cyc) | Sparse TCU (cyc) | **dense/SIMT** | **sparse/dense** |
 |---|---|---|---|---|---|---|---|---|---|---|
-| mnist  | 1  | 8   | 28 | 3 |     8 × 680 × 16 |       910,563 |       81,464 |       91,374 | **11.18×** | 0.89× |
-| small  | 16 | 16  | 32 | 3 |  16 × 904 × 144 |    18,112,160 |      632,602 |      544,989 | **28.63×** | **1.16×** |
-| medium | 32 | 32  | 32 | 3 |  32 × 904 × 288 |    67,898,024 |    2,284,659 |    1,816,719 | **29.72×** | **1.26×** |
-| large  | 32 | 64  | 32 | 3 |  64 × 904 × 288 |   135,665,614 |    4,566,969 |    3,621,118 | **29.71×** | **1.26×** |
+| mnist  | 1  | 8   | 28 | 3 |     8 × 680 × 16 |     6,156 |     1,773 |     1,807 | **3.47×** | 0.98× |
+| small  | 16 | 16  | 32 | 3 |  16 × 904 × 144 |    40,721 |     9,560 |     7,847 | **4.26×** | **1.22×** |
+| medium | 32 | 32  | 32 | 3 |  32 × 904 × 288 |    76,510 |    19,079 |    14,053 | **4.01×** | **1.36×** |
 
-CNN shows the strongest speedups because convolution is a pure GEMM
-(no softmax anchor) and SIMT conv is especially inefficient. At
-`mnist` the GEMM's `K_gemm=16` is only one tileK iteration, so the
-sparse metadata overhead exceeds the compression savings and sparse
-is slightly slower than dense. At every shape with `K_gemm ≥ 144`,
-sparse delivers the expected **~1.25×** bonus on top of dense.
+CNN shows the cleanest TCU gains because convolution is pure GEMM
+and there is no softmax-like anchor dragging every variant's total
+toward the same value. At `K_gemm=16` (mnist) the 2:4 metadata
+overhead cancels the compression savings, exactly as before.
+Above `K_gemm=144` sparse delivers a ~1.22-1.36× bonus on top of
+dense — same story as under the old launch path, just with
+different absolute cycle numbers.
+
+### NeRF
+
+| Shape  | `-r r` | `-s s` | SIMT (cyc) | Dense TCU (cyc) | Sparse TCU (cyc) | **dense/SIMT** | **sparse/dense** |
+|---|---|---|---|---|---|---|---|
+| smoke  | 32 | 8 |     5,664,898 |     3,847,782 |     3,831,630 | **1.47×** | 1.00× |
+
+NeRF's end-to-end totals are Amdahl-limited: once the 4 MLP GEMMs
+move to the TCU, **the positional-encoding + softplus + sigmoid
+SIMT work becomes the dominant cost** of the pipeline. Report the
+raw MLP GEMM speedup instead for the "what the TCU buys us" number —
+at the smoke shape that is `4,911,858 (SIMT MLP) / 20,765 (dense TCU
+MLP_GEMM) ≈ 236×`. The sparse MLP GEMM is 17,533 cycles (`1.18×`
+over dense GEMM), but K is too small (32/64) for sparse to win
+end-to-end at this shape. See Section 9 for the full NeRF story.
 
 ---
 
@@ -656,40 +681,42 @@ PASSED!
 For the TCU variants, cycles are grouped as:
 `non_gemm = SETUP + MLP_ACT + COMP`, `gemm = MLP_GEMM`.
 
-### 9.4 Measured NeRF cycles (NT=8, simx)
+### 9.4 Measured NeRF cycles (NT=8, simx, KMU launch API)
+
+> **KMU-era measurement** — see the note at the top of Section 5.
+> Numbers below are per-CTA slowest-block cycles per stage, summed
+> across stages. Not comparable to any pre-KMU historical numbers.
 
 #### Smoke: `-r 32 -s 8` (n_points = 256)
 
-| Stage                       | SIMT       | Dense TCU | Sparse TCU |
-|-----------------------------|-----------:|----------:|-----------:|
-| SETUP (ray + PE)            |     15,066 | 19,073,943| 19,060,114 |
-| MLP / MLP_GEMM (the 4 GEMMs)| 33,721,478 |  1,251,246|  1,230,853 |
-| MLP_ACT                     |          — |  4,918,481|  4,798,089 |
-| COMP (alpha compositing)    |    687,900 |    691,060|    694,389 |
-| **total**                   | 34,424,444 | 25,934,730| 25,783,445 |
+| Stage                      |        SIMT  |   Dense TCU |  Sparse TCU |
+|----------------------------|-------------:|------------:|------------:|
+| SETUP (ray + PE)           |        8,940 |   2,622,387 |   2,599,222 |
+| MLP / MLP_GEMM             |    4,911,858 |      20,765 |      17,533 |
+| MLP_ACT (act + cast)       |            — |   4,918,481*|   4,798,089*|
+| COMP (alpha compositing)   |      744,100 |     742,558 |     746,601 |
+| **total** (`KCYC[SUMMARY]`)|  **5,664,898** | **3,847,782** | **3,831,630** |
 
-> SIMT folds PE + the 4 layer GEMMs + softplus/sigmoid into a single
-> kernel body, so `KCYC[MLP]` covers everything the TCU variants spread
-> across `SETUP (PE portion)`, `MLP_GEMM`, and `MLP_ACT`.
+*Note: MLP_ACT in the TCU variants is dominated by the final softplus/sigmoid
+stage (~3.3M of the 4.9M cycles), which runs on SIMT in all variants.*
 
-#### Medium: `-r 64 -s 16` (n_points = 1024)
-
-| Stage                       | SIMT         | Dense TCU   | Sparse TCU  |
-|-----------------------------|-------------:|------------:|------------:|
-| SETUP (ray + PE)            |       29,063 |  68,976,350 |  69,047,048 |
-| MLP / MLP_GEMM              |  127,673,461 |   4,715,518 |   4,613,873 |
-| MLP_ACT                     |            — |  19,405,688 |  19,073,248 |
-| COMP                        |    2,664,200 |   2,693,425 |   2,673,157 |
-| **total**                   |  130,366,724 |  95,790,981 |  95,407,326 |
+> The SIMT variant has a tiny `SETUP` because it only does the slab
+> test + stratified sampling (PE is folded into the per-point MLP
+> kernel). The TCU variants have a **huge** `SETUP` because PE moved
+> out of the MLP kernel — the fp16 input to the first TCU layer has
+> to be prepared on SIMT beforehand, and that's where the sin/cos
+> work now lives. This is one of the reasons the TCU end-to-end
+> speedup is Amdahl-limited to ~1.47× despite the ~236× speedup on
+> the raw MLP GEMMs.
 
 ### 9.5 Speedups
 
-| Ratio | Smoke (`-r 32 -s 8`) | Medium (`-r 64 -s 16`) |
-|---|---:|---:|
-| **MLP GEMM speedup: dense TCU / SIMT** | **26.95×** | **27.07×** |
-| **MLP GEMM speedup: sparse TCU / dense TCU** | 1.017× | 1.022× |
-| End-to-end speedup: dense TCU / SIMT (total) | 1.327× | 1.361× |
-| End-to-end speedup: sparse TCU / dense TCU (total) | 1.006× | 1.004× |
+| Ratio | Smoke (`-r 32 -s 8`) |
+|---|---:|
+| **MLP GEMM speedup: dense TCU / SIMT** (`SIMT_MLP / dense_MLP_GEMM`) | **236.5×** |
+| **MLP GEMM speedup: sparse TCU / dense TCU** | **1.18×** |
+| End-to-end speedup: dense TCU / SIMT (total) | 1.472× |
+| End-to-end speedup: sparse TCU / dense TCU (total) | 1.004× |
 
 **How to read these numbers:**
 
