@@ -1,4 +1,4 @@
-#include <vx_spawn.h>
+#include <vx_spawn2.h>
 #include <vx_intrinsics.h>
 #include <vx_tensor.h>
 #include "common.h"
@@ -7,11 +7,12 @@ namespace vt = vortex::tensor;
 using sp_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
 
 // =============================================================================
-// akili_acccnn_tcu_sp — Sparse TCU conv2d via im2col + sgemm_tcu_sp-style GEMM.
-// Host prunes W 2:4 along K_gemm, compresses, packs metadata. Mirrors
-// tests/regression/sgemm_tcu_sp/kernel.cpp verbatim.
+// akili_acccnn_tcu_sp — Sparse (2:4) TCU conv2d via im2col + sgemm_tcu_sp-style
+// GEMM.  Host prunes W 2:4 along K_gemm, compresses, packs metadata.
 // =============================================================================
-void kernel_conv_sparse_body(kernel_arg_t* __UNIFORM__ arg) {
+__kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
+
   auto pA = reinterpret_cast<sp_ctx::input_t*>(arg->W_addr);
   auto pB = reinterpret_cast<sp_ctx::input_t*>(arg->B_addr);
   auto pC = reinterpret_cast<sp_ctx::output_t*>(arg->O_addr);
@@ -21,6 +22,7 @@ void kernel_conv_sparse_body(kernel_arg_t* __UNIFORM__ arg) {
   uint32_t N = arg->N_gemm;
   uint32_t K = arg->K_gemm;
   uint32_t stride_A = K / 2;
+  (void)M;
 
   sp_ctx::fragment_a   fragA;
   sp_ctx::fragment_b   fragB;
@@ -56,14 +58,11 @@ void kernel_conv_sparse_body(kernel_arg_t* __UNIFORM__ arg) {
 
   auto pTileC = pC + tile_row * N + tile_col;
   sp_ctx::store_matrix_sync(pTileC, fragC, N);
-}
 
-int main() {
-  kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-  uint64_t t_begin = vx_rdcycle();
-  int rc = vx_spawn_threads(2, arg->grid_dim, arg->block_dim,
-                            (vx_kernel_func_cb)kernel_conv_sparse_body, arg);
-  uint64_t t_end = vx_rdcycle();
-  arg->kernel_cycles = t_end - t_begin;
-  return rc;
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
+  }
 }

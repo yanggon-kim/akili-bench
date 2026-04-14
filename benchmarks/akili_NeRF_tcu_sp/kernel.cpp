@@ -1,31 +1,41 @@
-#include <vx_spawn.h>
+#include <vx_spawn2.h>
 #include <vx_intrinsics.h>
 #include <vx_tensor.h>
 #include <math.h>
 #include "common.h"
 
 // =============================================================================
-// akili_NeRF_tcu_sp — Full NeRF forward pass with the MLP GEMMs running on
-// the SPARSE (2:4) tensor core.  Only kernel_mlp_gemm changes vs the dense
-// variant: it uses the 5-arg sparse load_matrix_sync + metadata walk, and
-// the A pointer advances by tileK/2 per K iteration (compressed stride).
+// akili_NeRF_tcu_sp — Full NeRF forward pass with the MLP GEMMs on the SPARSE
+// (2:4) tensor core. KMU launch API.
 // =============================================================================
 
 namespace vt = vortex::tensor;
 using sp_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
 
+static inline uint16_t d_f2h(float x) {
+  uint32_t bits;
+  __builtin_memcpy(&bits, &x, sizeof(bits));
+  uint16_t sign = (uint16_t)((bits >> 16) & 0x8000);
+  uint16_t mant = (uint16_t)((bits >> 13) & 0x03FF);
+  int32_t  ex   = (int32_t)((bits >> 23) & 0xFF) - 127 + 15;
+  if (ex >= 31) return (uint16_t)(sign | 0x7C00);
+  if (ex <= 0)  return sign;
+  return (uint16_t)(sign | ((uint16_t)ex << 10) | mant);
+}
+
 // -----------------------------------------------------------------------------
-// Stage 1: ray setup + positional encoding (one task per point).
-// Identical to the dense TCU variant.
+// Stage 1: ray setup + PE (SIMT, one task per point).
 // -----------------------------------------------------------------------------
-void kernel_ray_setup(kernel_arg_t* __UNIFORM__ arg) {
+static inline void ray_setup_body(kernel_arg_t* arg) {
   auto rays_o  = reinterpret_cast<float*>(arg->rays_o_addr);
   auto rays_d  = reinterpret_cast<float*>(arg->rays_d_addr);
   auto aabb    = reinterpret_cast<float*>(arg->aabb_addr);
   auto pe_out  = reinterpret_cast<uint16_t*>(arg->pe_buf_addr);
   auto dlt_out = reinterpret_cast<float*>(arg->deltas_addr);
 
-  uint32_t pt     = blockIdx.x;
+  uint32_t pt = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pt >= arg->n_points) return;
+
   uint32_t S      = arg->n_samples;
   uint32_t n_pts  = arg->n_points;
   uint32_t ray    = pt / S;
@@ -61,29 +71,18 @@ void kernel_ray_setup(kernel_arg_t* __UNIFORM__ arg) {
   float pz = oz + t * dz;
   dlt_out[pt] = step;
 
-  auto f2h = [](float x) -> uint16_t {
-    uint32_t bits;
-    __builtin_memcpy(&bits, &x, sizeof(bits));
-    uint16_t sign = (uint16_t)((bits >> 16) & 0x8000);
-    uint16_t mant = (uint16_t)((bits >> 13) & 0x03FF);
-    int32_t  ex   = (int32_t)((bits >> 23) & 0xFF) - 127 + 15;
-    if (ex >= 31) return (uint16_t)(sign | 0x7C00);
-    if (ex <= 0)  return sign;
-    return (uint16_t)(sign | ((uint16_t)ex << 10) | mant);
-  };
-
-  pe_out[0 * n_pts + pt] = f2h(px);
-  pe_out[1 * n_pts + pt] = f2h(py);
-  pe_out[2 * n_pts + pt] = f2h(pz);
+  pe_out[0 * n_pts + pt] = d_f2h(px);
+  pe_out[1 * n_pts + pt] = d_f2h(py);
+  pe_out[2 * n_pts + pt] = d_f2h(pz);
   float freq = 1.0f;
   for (int L = 0; L < PE_L; ++L) {
     uint32_t base = 3 + L*6;
-    pe_out[(base+0) * n_pts + pt] = f2h(sinf(freq * px));
-    pe_out[(base+1) * n_pts + pt] = f2h(cosf(freq * px));
-    pe_out[(base+2) * n_pts + pt] = f2h(sinf(freq * py));
-    pe_out[(base+3) * n_pts + pt] = f2h(cosf(freq * py));
-    pe_out[(base+4) * n_pts + pt] = f2h(sinf(freq * pz));
-    pe_out[(base+5) * n_pts + pt] = f2h(cosf(freq * pz));
+    pe_out[(base+0) * n_pts + pt] = d_f2h(sinf(freq * px));
+    pe_out[(base+1) * n_pts + pt] = d_f2h(cosf(freq * px));
+    pe_out[(base+2) * n_pts + pt] = d_f2h(sinf(freq * py));
+    pe_out[(base+3) * n_pts + pt] = d_f2h(cosf(freq * py));
+    pe_out[(base+4) * n_pts + pt] = d_f2h(sinf(freq * pz));
+    pe_out[(base+5) * n_pts + pt] = d_f2h(cosf(freq * pz));
     freq *= 2.0f;
   }
   for (uint32_t f = MLP_IN_DIM; f < MLP_IN_DIM_PAD; ++f)
@@ -92,17 +91,9 @@ void kernel_ray_setup(kernel_arg_t* __UNIFORM__ arg) {
 
 // -----------------------------------------------------------------------------
 // Stage 2: SPARSE TCU MLP layer.
-//   C = A * B where:
-//     A = W_compressed [N_out x K_in/2] row-major, loaded with 5-arg sparse
-//         load_matrix_sync and per-tile metadata pointer
-//     B = X [K_in x n_points] row-major (dense activations, row-major load)
-//     C = Y [N_out x n_points] row-major store
-// Grid: (n_points / tileN, N_out / tileM)
-//
-// Metadata pointer walk mirrors akili_attn_tcu_sp/kernel.cpp:40-81.
 // -----------------------------------------------------------------------------
-void kernel_mlp_gemm(kernel_arg_t* __UNIFORM__ arg) {
-  auto pA = reinterpret_cast<sp_ctx::input_t*>(arg->W_cur_addr);   // compressed
+static inline void mlp_gemm_body(kernel_arg_t* arg) {
+  auto pA = reinterpret_cast<sp_ctx::input_t*>(arg->W_cur_addr);
   auto pB = reinterpret_cast<sp_ctx::input_t*>(arg->X_cur_addr);
   auto pC = reinterpret_cast<sp_ctx::output_t*>(arg->Y_cur_addr);
   auto pMetaBase = reinterpret_cast<const float*>(arg->meta_cur_addr);
@@ -118,7 +109,6 @@ void kernel_mlp_gemm(kernel_arg_t* __UNIFORM__ arg) {
   uint32_t tile_col = blockIdx.x * sp_ctx::tileN;
   sp_ctx::fill_fragment(fragC, 0);
 
-  // Metadata geometry (same derivation as akili_attn_tcu_sp).
   constexpr uint32_t rtl_i_ratio = 32 / vt::fp16::bits;
   constexpr uint32_t meta_cols = (NUM_TCU_LANES * 2 * rtl_i_ratio + 31) / 32;
   using kcfg = vt::wmma_config_t<NUM_TCU_LANES>;
@@ -128,12 +118,12 @@ void kernel_mlp_gemm(kernel_arg_t* __UNIFORM__ arg) {
 
   uint32_t num_k_tiles = K_in / sp_ctx::tileK;
   uint32_t tile_row_idx = blockIdx.y;
-  uint32_t stride_A = K_in / 2;   // compressed K
+  uint32_t stride_A = K_in / 2;
 
   auto pMetaSp = pMetaBase + tile_row_idx * num_k_tiles * per_k_tile_words;
   auto pTileA = pA + tile_row * stride_A;
-  constexpr uint32_t a_k_stride = sp_ctx::tileK / 2;  // compressed step
-  auto pTileB = pB + tile_col;  // row 0 of B, starting at col tile_col
+  constexpr uint32_t a_k_stride = sp_ctx::tileK / 2;
+  auto pTileB = pB + tile_col;
 
   for (int i = 0; i < (int)K_in; i += (int)sp_ctx::tileK) {
     sp_ctx::load_matrix_sync<vt::row_major>(fragA, pTileA, stride_A, nullptr, pMetaSp);
@@ -142,50 +132,41 @@ void kernel_mlp_gemm(kernel_arg_t* __UNIFORM__ arg) {
 
     pMetaSp += per_k_tile_words;
     pTileA  += a_k_stride;
-    pTileB  += sp_ctx::tileK * n_pts;   // advance tileK full rows in row-major B
+    pTileB  += sp_ctx::tileK * n_pts;
   }
 
   auto pTileC = pC + tile_row * n_pts + tile_col;
   sp_ctx::store_matrix_sync(pTileC, fragC, n_pts);
 }
 
-// -----------------------------------------------------------------------------
-// SIMT activation kernels — identical to dense TCU variant.
-// -----------------------------------------------------------------------------
-void kernel_mlp_act(kernel_arg_t* __UNIFORM__ arg) {
+static inline void mlp_act_body(kernel_arg_t* arg) {
   auto pY_fp32 = reinterpret_cast<float*>(arg->Y_cur_addr);
   auto pB      = reinterpret_cast<float*>(arg->B_cur_addr);
   auto pOut    = reinterpret_cast<uint16_t*>(arg->act_out_addr);
 
-  uint32_t tid = blockIdx.x;
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t total = arg->N_out_cur * arg->n_points;
+  if (tid >= total) return;
+
   uint32_t n_pts = arg->n_points;
   uint32_t row = tid / n_pts;
   uint32_t col = tid - row * n_pts;
 
   float v = pY_fp32[row * n_pts + col] + pB[row];
   if (v < 0.0f) v = 0.0f;
-
-  uint32_t bits;
-  __builtin_memcpy(&bits, &v, sizeof(bits));
-  uint16_t sign = (uint16_t)((bits >> 16) & 0x8000);
-  uint16_t mant = (uint16_t)((bits >> 13) & 0x03FF);
-  int32_t  ex   = (int32_t)((bits >> 23) & 0xFF) - 127 + 15;
-  uint16_t h;
-  if (ex >= 31)      h = (uint16_t)(sign | 0x7C00);
-  else if (ex <= 0)  h = sign;
-  else               h = (uint16_t)(sign | ((uint16_t)ex << 10) | mant);
-  pOut[row * n_pts + col] = h;
+  pOut[row * n_pts + col] = d_f2h(v);
 }
 
-void kernel_mlp_out_act(kernel_arg_t* __UNIFORM__ arg) {
+static inline void mlp_out_act_body(kernel_arg_t* arg) {
   auto pY_fp32 = reinterpret_cast<float*>(arg->Y_cur_addr);
   auto pB      = reinterpret_cast<float*>(arg->B_cur_addr);
   auto pSig    = reinterpret_cast<float*>(arg->sigmas_addr);
   auto pRGB    = reinterpret_cast<float*>(arg->rgbs_addr);
 
-  uint32_t tid = blockIdx.x;
-  uint32_t n_pts = arg->n_points;
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= arg->n_points) return;
 
+  uint32_t n_pts = arg->n_points;
   float s  = pY_fp32[0 * n_pts + tid] + pB[0];
   float r  = pY_fp32[1 * n_pts + tid] + pB[1];
   float g  = pY_fp32[2 * n_pts + tid] + pB[2];
@@ -196,13 +177,15 @@ void kernel_mlp_out_act(kernel_arg_t* __UNIFORM__ arg) {
   pRGB[tid*3 + 2]  = 1.0f / (1.0f + expf(-b));
 }
 
-void kernel_composite(kernel_arg_t* __UNIFORM__ arg) {
+static inline void composite_body(kernel_arg_t* arg) {
   auto sigmas = reinterpret_cast<float*>(arg->sigmas_addr);
   auto rgbs   = reinterpret_cast<float*>(arg->rgbs_addr);
   auto deltas = reinterpret_cast<float*>(arg->deltas_addr);
   auto image  = reinterpret_cast<float*>(arg->image_addr);
 
-  uint32_t ray = blockIdx.x;
+  uint32_t ray = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ray >= arg->n_rays) return;
+
   uint32_t S   = arg->n_samples;
   uint32_t base = ray * S;
 
@@ -224,47 +207,22 @@ void kernel_composite(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-int main() {
-  kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-  uint64_t t_begin = vx_rdcycle();
-  int rc = 0;
-  uint32_t n_tasks;
+__kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
 
   switch (arg->kernel_id) {
-    case KID_RAY_SETUP:
-      n_tasks = arg->n_points;
-      rc = vx_spawn_threads(1, &n_tasks, nullptr,
-                            (vx_kernel_func_cb)kernel_ray_setup, arg);
-      break;
-
-    case KID_MLP_GEMM:
-      rc = vx_spawn_threads(2, arg->grid_dim, arg->block_dim,
-                            (vx_kernel_func_cb)kernel_mlp_gemm, arg);
-      break;
-
-    case KID_MLP_ACT:
-      n_tasks = arg->N_out_cur * arg->n_points;
-      rc = vx_spawn_threads(1, &n_tasks, nullptr,
-                            (vx_kernel_func_cb)kernel_mlp_act, arg);
-      break;
-
-    case KID_MLP_OUT_ACT:
-      n_tasks = arg->n_points;
-      rc = vx_spawn_threads(1, &n_tasks, nullptr,
-                            (vx_kernel_func_cb)kernel_mlp_out_act, arg);
-      break;
-
-    case KID_COMPOSITE:
-      n_tasks = arg->n_rays;
-      rc = vx_spawn_threads(1, &n_tasks, nullptr,
-                            (vx_kernel_func_cb)kernel_composite, arg);
-      break;
-
-    default:
-      return -1;
+    case KID_RAY_SETUP:    ray_setup_body(arg);    break;
+    case KID_MLP_GEMM:     mlp_gemm_body(arg);     break;
+    case KID_MLP_ACT:      mlp_act_body(arg);      break;
+    case KID_MLP_OUT_ACT:  mlp_out_act_body(arg);  break;
+    case KID_COMPOSITE:    composite_body(arg);    break;
+    default: break;
   }
 
-  uint64_t t_end = vx_rdcycle();
-  arg->kernel_cycles = t_end - t_begin;
-  return rc;
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
+  }
 }

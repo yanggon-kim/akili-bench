@@ -1,4 +1,4 @@
-#include <vx_spawn.h>
+#include <vx_spawn2.h>
 #include <vx_intrinsics.h>
 #include <vx_print.h>
 #include <cmath>
@@ -6,23 +6,16 @@
 #include "common.h"
 
 // =============================================================================
-// akili_flash — SIMT FlashAttention.
-//
-// Two code paths live here:
-//
-//   (A) The original fused online-softmax kernel (template:
-//       flash_kernel_body<HEAD_DIM, BLOCK_SIZE_C>). One launch; each thread
-//       walks one Q row and streams K/V blocks of BLOCK_SIZE_C to build the
-//       output incrementally. Active only when d ∈ {1,2,4,8,16}. The host
-//       picks the right (HEAD_DIM, BLOCK_SIZE_C) template specialization.
-//
-//   (B) Unfused 3-stage attention kernels (flash_qk_simt → flash_softmax_body
-//       → flash_pv_simt). Used when d falls outside the fused template's
-//       supported set.
+// akili_flash — SIMT FlashAttention on the KMU launch API.
+// Two code paths share one binary, dispatched via arg->kernel_id:
+//   (A) Fused online-softmax kernel for d ∈ {1,2,4,8,16}   — KID_FLASH_FUSED
+//   (B) Unfused 3-stage SIMT attention                      — KID_QK_SIMT,
+//                                                             KID_SOFTMAX,
+//                                                             KID_PV_SIMT
 // =============================================================================
 
 template<uint32_t HEAD_DIM, uint32_t BLOCK_SIZE_C>
-void flash_kernel_body(kernel_arg_t *arg) {
+static inline void flash_kernel_body(kernel_arg_t* arg) {
   float* Q_ptr = reinterpret_cast<float*>(arg->Q_addr);
   float* K_ptr = reinterpret_cast<float*>(arg->K_addr);
   float* V_ptr = reinterpret_cast<float*>(arg->V_addr);
@@ -31,7 +24,7 @@ void flash_kernel_body(kernel_arg_t *arg) {
   auto seq_len = arg->seq_len;
   auto block_size_r = arg->block_size_r;
 
-  auto local_ptr = __local_mem((block_size_r + 2 * BLOCK_SIZE_C) * HEAD_DIM * sizeof(float));
+  auto local_ptr = __local_mem();
   auto local_Q = (float*)local_ptr;
   auto local_K = (float*)local_Q + block_size_r * HEAD_DIM;
   auto local_V = (float*)local_K + BLOCK_SIZE_C * HEAD_DIM;
@@ -105,28 +98,29 @@ void flash_kernel_body(kernel_arg_t *arg) {
 }
 
 // =============================================================================
-// Unfused 3-stage SIMT kernels. One thread per output element.
+// Unfused 3-stage SIMT kernels
 // =============================================================================
-void flash_qk_simt(kernel_arg_t* __UNIFORM__ arg) {
+static inline void flash_qk_simt_body(kernel_arg_t* arg) {
   auto Q = reinterpret_cast<float*>(arg->Q_addr);
   auto K = reinterpret_cast<float*>(arg->K_addr);
   auto S = reinterpret_cast<float*>(arg->S_addr);
   uint32_t N = arg->N;
   uint32_t d = arg->d;
-  int col = blockIdx.x;
-  int row = blockIdx.y;
-  if (row < (int)N && col < (int)N) {
+  uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row < N && col < N) {
     float sum = 0;
     for (uint32_t e = 0; e < d; ++e) sum += Q[row * d + e] * K[e * N + col];
     S[row * N + col] = sum;
   }
 }
 
-void flash_softmax_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void flash_softmax_body(kernel_arg_t* arg) {
   auto S = reinterpret_cast<float*>(arg->S_addr);
   auto P = reinterpret_cast<float*>(arg->P_addr);
   uint32_t N = arg->N;
-  int row = blockIdx.x;
+  uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= N) return;
 
   float max_val = S[row * N];
   for (uint32_t col = 1; col < N; ++col) {
@@ -143,24 +137,23 @@ void flash_softmax_body(kernel_arg_t* __UNIFORM__ arg) {
   for (uint32_t col = 0; col < N; ++col) P[row * N + col] = local_P[col] / exp_sum;
 }
 
-void flash_pv_simt(kernel_arg_t* __UNIFORM__ arg) {
+static inline void flash_pv_simt_body(kernel_arg_t* arg) {
   auto P = reinterpret_cast<float*>(arg->P_addr);
   auto V = reinterpret_cast<float*>(arg->V_addr);
   auto O = reinterpret_cast<float*>(arg->O_addr);
   uint32_t N = arg->N;
   uint32_t d = arg->d;
-  int col = blockIdx.x;
-  int row = blockIdx.y;
-  if (row < (int)N && col < (int)d) {
+  uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row < N && col < d) {
     float sum = 0;
     for (uint32_t e = 0; e < N; ++e) sum += P[row * N + e] * V[e * d + col];
     O[row * d + col] = sum;
   }
 }
 
-// Fused entry — host sets head_dim/block_size_c and we dispatch to the
-// corresponding template specialization.
-void flash_kernel_entry(kernel_arg_t* arg) {
+// Fused entry — dispatches to template specialization based on head_dim/block_size_c
+static inline void flash_fused_body(kernel_arg_t* arg) {
   switch (arg->head_dim) {
     case 1:
       switch (arg->block_size_c) {
@@ -201,31 +194,21 @@ void flash_kernel_entry(kernel_arg_t* arg) {
 }
 
 // =============================================================================
-int main() {
-  kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-  uint64_t t_begin = vx_rdcycle();
-  int rc = 0;
+__kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
+
   switch (arg->kernel_id) {
-    case KID_FLASH_FUSED:
-      rc = vx_spawn_threads(1, arg->grid_dim, arg->block_dim,
-                            (vx_kernel_func_cb)flash_kernel_entry, arg);
-      break;
-    case KID_QK_SIMT:
-      rc = vx_spawn_threads(2, arg->grid_dim, nullptr,
-                            (vx_kernel_func_cb)flash_qk_simt, arg);
-      break;
-    case KID_SOFTMAX:
-      rc = vx_spawn_threads(1, arg->grid_dim, nullptr,
-                            (vx_kernel_func_cb)flash_softmax_body, arg);
-      break;
-    case KID_PV_SIMT:
-      rc = vx_spawn_threads(2, arg->grid_dim, nullptr,
-                            (vx_kernel_func_cb)flash_pv_simt, arg);
-      break;
-    default:
-      return -1;
+    case KID_FLASH_FUSED: flash_fused_body(arg);    break;
+    case KID_QK_SIMT:     flash_qk_simt_body(arg);  break;
+    case KID_SOFTMAX:     flash_softmax_body(arg);  break;
+    case KID_PV_SIMT:     flash_pv_simt_body(arg);  break;
+    default: break;
   }
-  uint64_t t_end = vx_rdcycle();
-  arg->kernel_cycles = t_end - t_begin;
-  return rc;
+
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
+  }
 }

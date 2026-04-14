@@ -57,6 +57,7 @@ vx_buffer_h w3_buf = nullptr, b3_buf = nullptr;
 vx_buffer_h sigma_buf  = nullptr;
 vx_buffer_h rgb_buf    = nullptr;
 vx_buffer_h image_buf  = nullptr;
+vx_buffer_h cycles_buffer = nullptr;
 vx_buffer_h krnl_buffer = nullptr;
 vx_buffer_h args_buffer = nullptr;
 kernel_arg_t kernel_arg = {};
@@ -98,6 +99,7 @@ void cleanup() {
     if (sigma_buf)  vx_mem_free(sigma_buf);
     if (rgb_buf)    vx_mem_free(rgb_buf);
     if (image_buf)  vx_mem_free(image_buf);
+    if (cycles_buffer) vx_mem_free(cycles_buffer);
     if (krnl_buffer) vx_mem_free(krnl_buffer);
     if (args_buffer) vx_mem_free(args_buffer);
     vx_dev_close(device);
@@ -237,12 +239,13 @@ static void composite_cpu(float* image,
 }
 
 // ---------------------------------------------------------------------------
-static uint64_t read_back_cycles(const char* stage_tag) {
-  kernel_arg_t back = {};
-  vx_copy_from_dev(&back, args_buffer, 0, sizeof(kernel_arg_t));
-  printf("KCYC[%s,nt=%u]: %lu\n",
-         stage_tag, (unsigned)NUM_THREADS, (unsigned long)back.kernel_cycles);
-  return (uint64_t)back.kernel_cycles;
+static uint64_t read_back_cycles(const char* stage_tag, uint32_t num_blocks) {
+  std::vector<uint32_t> h_cycles(num_blocks, 0);
+  vx_copy_from_dev(h_cycles.data(), cycles_buffer, 0, num_blocks * sizeof(uint32_t));
+  uint32_t max_cyc = 0;
+  for (auto c : h_cycles) if (c > max_cyc) max_cyc = c;
+  printf("KCYC[%s,nt=%u]: %u\n", stage_tag, (unsigned)NUM_THREADS, max_cyc);
+  return (uint64_t)max_cyc;
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +355,18 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_mem_alloc(device, image_bytes, VX_MEM_READ_WRITE, &image_buf));
   RT_CHECK(vx_mem_address(image_buf, &kernel_arg.image_addr));
 
+  // Per-stage grid/block shapes — the largest grid sets the cycles buffer size.
+  // All 3 stages use block_dim = {NUM_THREADS, 1}.
+  uint32_t grid_setup     = (n_rays   + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t grid_mlp       = (n_points + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t grid_comp      = (n_rays   + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t max_blocks     = grid_setup;
+  if (grid_mlp  > max_blocks) max_blocks = grid_mlp;
+  if (grid_comp > max_blocks) max_blocks = grid_comp;
+  RT_CHECK(vx_mem_alloc(device, max_blocks * sizeof(uint32_t),
+                        VX_MEM_READ_WRITE, &cycles_buffer));
+  RT_CHECK(vx_mem_address(cycles_buffer, &kernel_arg.cycles_addr));
+
   kernel_arg.n_rays    = n_rays;
   kernel_arg.n_samples = n_samples;
   kernel_arg.min_near  = min_near;
@@ -378,13 +393,18 @@ int main(int argc, char* argv[]) {
 
   uint64_t cyc_setup = 0, cyc_mlp = 0, cyc_comp = 0;
 
+  uint32_t block_dim[2] = {NUM_THREADS, 1};
+
   // ================== Stage 1: ray setup ==================
   std::cout << "=== Stage 1: ray setup ===" << std::endl;
   kernel_arg.kernel_id = KID_RAY_SETUP;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+  {
+    uint32_t grid_dim[2] = {grid_setup, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
+  }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  cyc_setup = read_back_cycles("SETUP");
+  cyc_setup = read_back_cycles("SETUP", grid_setup);
 
   std::vector<float> h_spos(n_points * 3);
   std::vector<float> h_deltas(n_points);
@@ -413,9 +433,12 @@ int main(int argc, char* argv[]) {
   std::cout << "=== Stage 2: tiny MLP forward ===" << std::endl;
   kernel_arg.kernel_id = KID_MLP_FWD;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+  {
+    uint32_t grid_dim[2] = {grid_mlp, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
+  }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  cyc_mlp = read_back_cycles("MLP");
+  cyc_mlp = read_back_cycles("MLP", grid_mlp);
 
   std::vector<float> h_sigmas(n_points);
   std::vector<float> h_rgbs(n_points * 3);
@@ -447,9 +470,12 @@ int main(int argc, char* argv[]) {
   std::cout << "=== Stage 3: alpha compositing ===" << std::endl;
   kernel_arg.kernel_id = KID_COMPOSITE;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+  {
+    uint32_t grid_dim[2] = {grid_comp, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
+  }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  cyc_comp = read_back_cycles("COMP");
+  cyc_comp = read_back_cycles("COMP", grid_comp);
 
   std::vector<float> h_image(n_rays * 3);
   RT_CHECK(vx_copy_from_dev(h_image.data(), image_buf, 0, image_bytes));

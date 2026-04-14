@@ -1,26 +1,26 @@
-#include <vx_spawn.h>
+#include <vx_spawn2.h>
 #include <vx_intrinsics.h>
 #include "common.h"
 #include <cmath>
 #include <algorithm>
 
 // =============================================================================
-// SIMT attention kernels.
-//   kernel0_body  : S[i,j] = sum_k Q[i,k] * K[k,j]      — one thread per (i,j)
-//   kernel1_body  : P = softmax(S) row-wise             — one thread per row
-//   kernel2_body  : O[i,j] = sum_k P[i,k] * V[k,j]      — one thread per (i,j)
+// akili_attn — SIMT attention (KMU launch API).
+//   kernel0_body  : S[i,j] = sum_k Q[i,k] * K[k,j]      — 2D grid (col, row)
+//   kernel1_body  : P = softmax(S) row-wise             — 1D grid (row)
+//   kernel2_body  : O[i,j] = sum_k P[i,k] * V[k,j]      — 2D grid (col, row)
 // =============================================================================
 
-void kernel0_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void kernel0_body(kernel_arg_t* arg) {
   auto Q = reinterpret_cast<TYPE*>(arg->Q_addr);
   auto K = reinterpret_cast<TYPE*>(arg->K_addr);
   auto S = reinterpret_cast<TYPE*>(arg->S_addr);
   auto N = arg->N;
   auto d = arg->d;
 
-  int col = blockIdx.x;
-  int row = blockIdx.y;
-  if (row >= (int)N || col >= (int)N) return;
+  uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= N || col >= N) return;
 
   TYPE sum(0);
   for (uint32_t e = 0; e < d; ++e) {
@@ -29,12 +29,13 @@ void kernel0_body(kernel_arg_t* __UNIFORM__ arg) {
   S[row * N + col] = sum;
 }
 
-void kernel1_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void kernel1_body(kernel_arg_t* arg) {
   auto S = reinterpret_cast<TYPE*>(arg->S_addr);
   auto P = reinterpret_cast<TYPE*>(arg->P_addr);
   auto N = arg->N;
 
-  int row = blockIdx.x;
+  uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= N) return;
 
   TYPE max_val = S[row * N];
   for (uint32_t col = 1; col < N; ++col) {
@@ -53,16 +54,16 @@ void kernel1_body(kernel_arg_t* __UNIFORM__ arg) {
   }
 }
 
-void kernel2_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void kernel2_body(kernel_arg_t* arg) {
   auto P = reinterpret_cast<TYPE*>(arg->P_addr);
   auto V = reinterpret_cast<TYPE*>(arg->V_addr);
   auto O = reinterpret_cast<TYPE*>(arg->O_addr);
   auto N = arg->N;
   auto d = arg->d;
 
-  int col = blockIdx.x;
-  int row = blockIdx.y;
-  if (row >= (int)N || col >= (int)d) return;
+  uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= N || col >= d) return;
 
   TYPE sum(0);
   for (uint32_t e = 0; e < N; ++e) {
@@ -72,32 +73,20 @@ void kernel2_body(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Entry point — wraps each spawn in rdcycle timing.
-// =============================================================================
-int main() {
-  kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-
-  uint64_t t_begin = vx_rdcycle();
-  int rc = 0;
+__kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
 
   switch (arg->kernel_id) {
-    case KID_QK_SIMT:
-      rc = vx_spawn_threads(2, arg->grid_dim, nullptr,
-                            (vx_kernel_func_cb)kernel0_body, arg);
-      break;
-    case KID_SOFTMAX:
-      rc = vx_spawn_threads(1, arg->grid_dim, nullptr,
-                            (vx_kernel_func_cb)kernel1_body, arg);
-      break;
-    case KID_PV_SIMT:
-      rc = vx_spawn_threads(2, arg->grid_dim, nullptr,
-                            (vx_kernel_func_cb)kernel2_body, arg);
-      break;
-    default:
-      return -1;
+    case KID_QK_SIMT: kernel0_body(arg); break;
+    case KID_SOFTMAX: kernel1_body(arg); break;
+    case KID_PV_SIMT: kernel2_body(arg); break;
+    default: break;
   }
 
-  uint64_t t_end = vx_rdcycle();
-  arg->kernel_cycles = t_end - t_begin;
-  return rc;
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
+  }
 }

@@ -1,32 +1,36 @@
-#include <vx_spawn.h>
+#include <vx_spawn2.h>
 #include <vx_intrinsics.h>
 #include <math.h>
 #include "common.h"
 
 // =============================================================================
-// akili_NeRF — SIMT full-NeRF forward pass.
-//   kernel0_body : ray-AABB slab test + stratified sampling      (non-GEMM)
-//   kernel1_body : tiny NeRF MLP forward per (ray, sample) point (GEMM)
-//   kernel2_body : per-ray alpha compositing                      (non-GEMM)
+// akili_NeRF — SIMT full-NeRF forward pass on the KMU launch API.
+//
+// Three kernel_ids dispatched by the host, each handled by one body function
+// inside __kernel void kernel_main.  For SIMT stages we map each task onto
+// a (block, thread) pair: tid = blockIdx.x * blockDim.x + threadIdx.x.
+//
+//   KID_RAY_SETUP : 1 task per ray         (ray_setup_body)
+//   KID_MLP_FWD   : 1 task per sample pt   (mlp_fwd_body)
+//   KID_COMPOSITE : 1 task per ray         (composite_body)
 // =============================================================================
 
-// ---- Stage 1: ray setup ----
-void kernel0_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void ray_setup_body(kernel_arg_t* arg) {
   auto rays_o  = reinterpret_cast<float*>(arg->rays_o_addr);
   auto rays_d  = reinterpret_cast<float*>(arg->rays_d_addr);
   auto aabb    = reinterpret_cast<float*>(arg->aabb_addr);
   auto pos_out = reinterpret_cast<float*>(arg->sample_pos_addr);
   auto dlt_out = reinterpret_cast<float*>(arg->deltas_addr);
 
-  uint32_t ray = blockIdx.x;
+  uint32_t ray = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ray >= arg->n_rays) return;
+
   uint32_t S   = arg->n_samples;
   float min_near = arg->min_near;
 
   float ox = rays_o[ray*3+0], oy = rays_o[ray*3+1], oz = rays_o[ray*3+2];
   float dx = rays_d[ray*3+0], dy = rays_d[ray*3+1], dz = rays_d[ray*3+2];
 
-  // Slab test against a single AABB [aabb[0..2], aabb[3..5]].
-  // Host guarantees all direction components are non-zero.
   float inv_dx = 1.0f / dx;
   float inv_dy = 1.0f / dy;
   float inv_dz = 1.0f / dz;
@@ -50,13 +54,9 @@ void kernel0_body(kernel_arg_t* __UNIFORM__ arg) {
   if (tmax_z < tmax) tmax = tmax_z;
   if (tmin < min_near) tmin = min_near;
 
-  // Rays that miss collapse all samples to t=tmin with step=0 → alpha=0.
   float step = 0.0f;
-  if (tmax > tmin) {
-    step = (tmax - tmin) / (float)S;
-  } else {
-    tmax = tmin;
-  }
+  if (tmax > tmin) step = (tmax - tmin) / (float)S;
+  else             tmax = tmin;
 
   for (uint32_t s = 0; s < S; ++s) {
     float t = tmin + ((float)s + 0.5f) * step;
@@ -68,8 +68,7 @@ void kernel0_body(kernel_arg_t* __UNIFORM__ arg) {
   }
 }
 
-// ---- Stage 2: tiny NeRF MLP forward ----
-void kernel1_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void mlp_fwd_body(kernel_arg_t* arg) {
   auto pos    = reinterpret_cast<float*>(arg->sample_pos_addr);
   auto W0     = reinterpret_cast<float*>(arg->w0_addr);
   auto B0     = reinterpret_cast<float*>(arg->b0_addr);
@@ -82,15 +81,14 @@ void kernel1_body(kernel_arg_t* __UNIFORM__ arg) {
   auto sigmas = reinterpret_cast<float*>(arg->sigmas_addr);
   auto rgbs   = reinterpret_cast<float*>(arg->rgbs_addr);
 
-  uint32_t tid = blockIdx.x;
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t total = arg->n_rays * arg->n_samples;
+  if (tid >= total) return;
+
   float x = pos[tid * 3 + 0];
   float y = pos[tid * 3 + 1];
   float z = pos[tid * 3 + 2];
 
-  // Positional encoding → 27 features packed into h_a[0..26].
-  // Layout: [x, y, z, sin(f0 x), cos(f0 x), sin(f0 y), cos(f0 y),
-  //          sin(f0 z), cos(f0 z), sin(f1 x), cos(f1 x), ...]
-  // Slots 27..31 stay 0; they are never read by layer 0 (k < MLP_IN_DIM).
   float h_a[MLP_W];
   float h_b[MLP_W];
   for (int i = 0; i < MLP_W; ++i) h_a[i] = 0.0f;
@@ -108,25 +106,25 @@ void kernel1_body(kernel_arg_t* __UNIFORM__ arg) {
     freq *= 2.0f;
   }
 
-  // Layer 0: 27 -> 32 + ReLU  (h_a -> h_b)
+  // Layer 0: 27 -> MLP_W + ReLU  (h_a -> h_b)
   for (int j = 0; j < MLP_W; ++j) {
     float sum = B0[j];
     for (int k = 0; k < MLP_IN_DIM; ++k) sum += h_a[k] * W0[k * MLP_W + j];
     h_b[j] = (sum > 0.0f) ? sum : 0.0f;
   }
-  // Layer 1: 32 -> 32 + ReLU  (h_b -> h_a)
+  // Layer 1: MLP_W -> MLP_W + ReLU  (h_b -> h_a)
   for (int j = 0; j < MLP_W; ++j) {
     float sum = B1[j];
     for (int k = 0; k < MLP_W; ++k) sum += h_b[k] * W1[k * MLP_W + j];
     h_a[j] = (sum > 0.0f) ? sum : 0.0f;
   }
-  // Layer 2: 32 -> 32 + ReLU  (h_a -> h_b)
+  // Layer 2: MLP_W -> MLP_W + ReLU  (h_a -> h_b)
   for (int j = 0; j < MLP_W; ++j) {
     float sum = B2[j];
     for (int k = 0; k < MLP_W; ++k) sum += h_a[k] * W2[k * MLP_W + j];
     h_b[j] = (sum > 0.0f) ? sum : 0.0f;
   }
-  // Layer 3: 32 -> 4 (linear, no activation)
+  // Layer 3: MLP_W -> MLP_OUT_DIM (linear)
   float o0 = B3[0];
   float o1 = B3[1];
   float o2 = B3[2];
@@ -139,21 +137,21 @@ void kernel1_body(kernel_arg_t* __UNIFORM__ arg) {
     o3 += hv * W3[k * MLP_OUT_DIM + 3];
   }
 
-  // NeRF activation convention: sigma via softplus, rgb via sigmoid.
   sigmas[tid]             = logf(1.0f + expf(o0));
   rgbs[tid * 3 + 0]       = 1.0f / (1.0f + expf(-o1));
   rgbs[tid * 3 + 1]       = 1.0f / (1.0f + expf(-o2));
   rgbs[tid * 3 + 2]       = 1.0f / (1.0f + expf(-o3));
 }
 
-// ---- Stage 3: alpha compositing ----
-void kernel2_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void composite_body(kernel_arg_t* arg) {
   auto sigmas = reinterpret_cast<float*>(arg->sigmas_addr);
   auto rgbs   = reinterpret_cast<float*>(arg->rgbs_addr);
   auto deltas = reinterpret_cast<float*>(arg->deltas_addr);
   auto image  = reinterpret_cast<float*>(arg->image_addr);
 
-  uint32_t ray = blockIdx.x;
+  uint32_t ray = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ray >= arg->n_rays) return;
+
   uint32_t S   = arg->n_samples;
   uint32_t base = ray * S;
 
@@ -175,36 +173,24 @@ void kernel2_body(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Entry point — one spawn per stage, cycles recorded via vx_rdcycle().
+// KMU kernel entry point. Each CTA dispatched by the KMU runs kernel_main once.
+// Stage is selected by arg->kernel_id; per-CTA cycles are written to
+// arg->cycles_addr[block_id].
 // =============================================================================
-int main() {
-  kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-
-  uint64_t t_begin = vx_rdcycle();
-  int rc = 0;
-  uint32_t n_tasks;
+__kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
 
   switch (arg->kernel_id) {
-    case KID_RAY_SETUP:
-      n_tasks = arg->n_rays;
-      rc = vx_spawn_threads(1, &n_tasks, nullptr,
-                            (vx_kernel_func_cb)kernel0_body, arg);
-      break;
-    case KID_MLP_FWD:
-      n_tasks = arg->n_rays * arg->n_samples;
-      rc = vx_spawn_threads(1, &n_tasks, nullptr,
-                            (vx_kernel_func_cb)kernel1_body, arg);
-      break;
-    case KID_COMPOSITE:
-      n_tasks = arg->n_rays;
-      rc = vx_spawn_threads(1, &n_tasks, nullptr,
-                            (vx_kernel_func_cb)kernel2_body, arg);
-      break;
-    default:
-      return -1;
+    case KID_RAY_SETUP: ray_setup_body(arg); break;
+    case KID_MLP_FWD:   mlp_fwd_body(arg);   break;
+    case KID_COMPOSITE: composite_body(arg); break;
+    default: break;
   }
 
-  uint64_t t_end = vx_rdcycle();
-  arg->kernel_cycles = t_end - t_begin;
-  return rc;
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
+  }
 }

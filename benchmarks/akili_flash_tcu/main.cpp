@@ -110,6 +110,7 @@ vx_buffer_h P_fp16_buffer = nullptr;
 vx_buffer_h S_buffer      = nullptr;
 vx_buffer_h P_fp32_buffer = nullptr;
 vx_buffer_h O_buffer      = nullptr;
+vx_buffer_h cycles_buffer = nullptr;
 vx_buffer_h krnl_buffer = nullptr;
 vx_buffer_h args_buffer = nullptr;
 kernel_arg_t kernel_arg = {};
@@ -141,17 +142,19 @@ void cleanup() {
     if (S_buffer)      vx_mem_free(S_buffer);
     if (P_fp32_buffer) vx_mem_free(P_fp32_buffer);
     if (O_buffer)      vx_mem_free(O_buffer);
+    if (cycles_buffer) vx_mem_free(cycles_buffer);
     if (krnl_buffer)   vx_mem_free(krnl_buffer);
     if (args_buffer)   vx_mem_free(args_buffer);
     vx_dev_close(device);
   }
 }
 
-static void read_back_cycles(const char* stage_tag) {
-  kernel_arg_t back = {};
-  vx_copy_from_dev(&back, args_buffer, 0, sizeof(kernel_arg_t));
-  printf("KCYC[%s,nt=%u]: %lu\n",
-         stage_tag, (unsigned)NUM_THREADS, (unsigned long)back.kernel_cycles);
+static void read_back_cycles(const char* stage_tag, uint32_t num_blocks) {
+  std::vector<uint32_t> h_cycles(num_blocks, 0);
+  vx_copy_from_dev(h_cycles.data(), cycles_buffer, 0, num_blocks * sizeof(uint32_t));
+  uint32_t max_cyc = 0;
+  for (auto c : h_cycles) if (c > max_cyc) max_cyc = c;
+  printf("KCYC[%s,nt=%u]: %u\n", stage_tag, (unsigned)NUM_THREADS, max_cyc);
 }
 
 int main(int argc, char* argv[]) {
@@ -237,21 +240,33 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_mem_alloc(device, sizeof(kernel_arg_t), VX_MEM_READ_WRITE, &args_buffer));
 
+  // Compute grid sizes per stage and allocate max-sized cycles buffer.
+  uint32_t qk_blocks = (N / TN) * (N / TM);
+  uint32_t sm_blocks = (N + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t pv_blocks = (d / TN) * (N / TM);
+  uint32_t max_blocks = qk_blocks;
+  if (sm_blocks > max_blocks) max_blocks = sm_blocks;
+  if (pv_blocks > max_blocks) max_blocks = pv_blocks;
+  RT_CHECK(vx_mem_alloc(device, max_blocks * sizeof(uint32_t),
+                        VX_MEM_READ_WRITE, &cycles_buffer));
+  RT_CHECK(vx_mem_address(cycles_buffer, &kernel_arg.cycles_addr));
+
   int errors = 0;
   const float atol = 2e-2f;
   const float rtol = 2e-2f;
 
+  uint32_t block_dim[2] = {NUM_THREADS, 1};
+
   // ---------------- Stage 1: S = Q @ K^T (dense TCU) ----------------
   std::cout << "=== Stage 1: S = Q @ K^T (dense TCU) ===" << std::endl;
-  kernel_arg.grid_dim[0]  = N / TN;
-  kernel_arg.grid_dim[1]  = N / TM;
-  kernel_arg.block_dim[0] = NUM_THREADS;
-  kernel_arg.block_dim[1] = 1;
-  kernel_arg.kernel_id    = KID_QK_TCU;
+  kernel_arg.kernel_id = KID_QK_TCU;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+  {
+    uint32_t grid_dim[2] = {N / TN, N / TM};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, 0));
+  }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("QK");
+  read_back_cycles("QK", qk_blocks);
 
   std::vector<float> h_S(N * N, 0.0f);
   RT_CHECK(vx_copy_from_dev(h_S.data(), S_buffer, 0, s_fp32_bytes));
@@ -278,14 +293,15 @@ int main(int argc, char* argv[]) {
 
   // ---------------- Stage 2: P = softmax(S) — SIMT fp32 ----------------
   std::cout << "=== Stage 2: P = softmax(S) ===" << std::endl;
-  kernel_arg.P_addr      = P_fp32_addr;
-  kernel_arg.grid_dim[0] = N;
-  kernel_arg.grid_dim[1] = 1;
-  kernel_arg.kernel_id   = KID_SOFTMAX;
+  kernel_arg.P_addr    = P_fp32_addr;
+  kernel_arg.kernel_id = KID_SOFTMAX;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+  {
+    uint32_t grid_dim[2] = {sm_blocks, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
+  }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("SM");
+  read_back_cycles("SM", sm_blocks);
 
   std::vector<float> h_P(N * N);
   RT_CHECK(vx_copy_from_dev(h_P.data(), P_fp32_buffer, 0, s_fp32_bytes));
@@ -311,16 +327,15 @@ int main(int argc, char* argv[]) {
     for (uint32_t i = 0; i < N * N; ++i) h_P_fp16[i] = f2h_host(h_P[i]);
     RT_CHECK(vx_copy_to_dev(P_fp16_buffer, h_P_fp16.data(), 0, s_fp16_bytes));
   }
-  kernel_arg.P_addr      = P_fp16_addr;
-  kernel_arg.grid_dim[0] = d / TN;
-  kernel_arg.grid_dim[1] = N / TM;
-  kernel_arg.block_dim[0] = NUM_THREADS;
-  kernel_arg.block_dim[1] = 1;
-  kernel_arg.kernel_id   = KID_PV_TCU;
+  kernel_arg.P_addr    = P_fp16_addr;
+  kernel_arg.kernel_id = KID_PV_TCU;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+  {
+    uint32_t grid_dim[2] = {d / TN, N / TM};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, 0));
+  }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("PV");
+  read_back_cycles("PV", pv_blocks);
 
   std::vector<float> h_O(N * d);
   RT_CHECK(vx_copy_from_dev(h_O.data(), O_buffer, 0, out_bytes));

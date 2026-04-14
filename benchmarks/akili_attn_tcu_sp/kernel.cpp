@@ -1,4 +1,4 @@
-#include <vx_spawn.h>
+#include <vx_spawn2.h>
 #include <vx_intrinsics.h>
 #include <vx_tensor.h>
 #include "common.h"
@@ -9,13 +9,15 @@ namespace vt = vortex::tensor;
 using sp_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
 
 // =============================================================================
-// Stage 2: SIMT softmax on fp32 S. One thread per row.
+// Stage 2: SIMT softmax on fp32 S.
 // =============================================================================
-void kernel_softmax(kernel_arg_t* __UNIFORM__ arg) {
+static inline void softmax_body(kernel_arg_t* arg) {
   auto S = reinterpret_cast<float*>(arg->S_addr);
   auto P = reinterpret_cast<float*>(arg->P_addr);
   uint32_t N = arg->N;
-  int row = blockIdx.x;
+
+  uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= N) return;
 
   float max_val = S[row * N];
   for (uint32_t col = 1; col < N; ++col)
@@ -33,9 +35,7 @@ void kernel_softmax(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Shared sparse mma inner loop.  Parameterized on K_walk so QK (K=d_attn)
-// and PV (K=N_attn) can share one implementation.  Mirrors
-// tests/regression/sgemm_tcu_sp/kernel.cpp verbatim.
+// Shared sparse MMA inner loop.
 // =============================================================================
 static inline void sparse_mma_loop(sp_ctx::input_t* pA_base,
                                    sp_ctx::input_t* pB_base,
@@ -80,10 +80,7 @@ static inline void sparse_mma_loop(sp_ctx::input_t* pA_base,
   sp_ctx::store_matrix_sync(pTileC, fragC, c_stride);
 }
 
-// =============================================================================
-// Stage 1: sparse TCU S = Q·Kᵀ
-// =============================================================================
-void kernel_qk_sparse(kernel_arg_t* __UNIFORM__ arg) {
+static inline void qk_sparse_body(kernel_arg_t* arg) {
   auto pA = reinterpret_cast<sp_ctx::input_t*>(arg->Q_addr);
   auto pB = reinterpret_cast<sp_ctx::input_t*>(arg->K_addr);
   auto pC = reinterpret_cast<sp_ctx::output_t*>(arg->S_addr);
@@ -91,10 +88,7 @@ void kernel_qk_sparse(kernel_arg_t* __UNIFORM__ arg) {
   sparse_mma_loop(pA, pB, pC, pMetaBase, arg->d, arg->N);
 }
 
-// =============================================================================
-// Stage 3: sparse TCU O = P·V
-// =============================================================================
-void kernel_pv_sparse(kernel_arg_t* __UNIFORM__ arg) {
+static inline void pv_sparse_body(kernel_arg_t* arg) {
   auto pA = reinterpret_cast<sp_ctx::input_t*>(arg->P_addr);
   auto pB = reinterpret_cast<sp_ctx::input_t*>(arg->V_addr);
   auto pC = reinterpret_cast<sp_ctx::output_t*>(arg->O_addr);
@@ -103,29 +97,20 @@ void kernel_pv_sparse(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-int main() {
-  kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-  uint64_t t_begin = vx_rdcycle();
-  int rc = 0;
+__kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
 
   switch (arg->kernel_id) {
-    case KID_QK_SPARSE:
-      rc = vx_spawn_threads(2, arg->grid_dim, arg->block_dim,
-                            (vx_kernel_func_cb)kernel_qk_sparse, arg);
-      break;
-    case KID_SOFTMAX:
-      rc = vx_spawn_threads(1, arg->grid_dim, nullptr,
-                            (vx_kernel_func_cb)kernel_softmax, arg);
-      break;
-    case KID_PV_SPARSE:
-      rc = vx_spawn_threads(2, arg->grid_dim, arg->block_dim,
-                            (vx_kernel_func_cb)kernel_pv_sparse, arg);
-      break;
-    default:
-      return -1;
+    case KID_QK_SPARSE: qk_sparse_body(arg); break;
+    case KID_SOFTMAX:   softmax_body(arg);   break;
+    case KID_PV_SPARSE: pv_sparse_body(arg); break;
+    default: break;
   }
 
-  uint64_t t_end = vx_rdcycle();
-  arg->kernel_cycles = t_end - t_begin;
-  return rc;
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
+  }
 }

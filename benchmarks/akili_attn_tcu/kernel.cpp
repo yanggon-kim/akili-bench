@@ -1,4 +1,4 @@
-#include <vx_spawn.h>
+#include <vx_spawn2.h>
 #include <vx_intrinsics.h>
 #include <vx_tensor.h>
 #include "common.h"
@@ -9,13 +9,15 @@ namespace vt = vortex::tensor;
 using tcu_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
 
 // =============================================================================
-// Stage 2: SIMT softmax on fp32 S. One thread per row.
+// Stage 2: SIMT softmax on fp32 S. One row per flat thread index.
 // =============================================================================
-void kernel_softmax(kernel_arg_t* __UNIFORM__ arg) {
+static inline void softmax_body(kernel_arg_t* arg) {
   auto S = reinterpret_cast<float*>(arg->S_addr);
   auto P = reinterpret_cast<float*>(arg->P_addr);
   uint32_t N = arg->N;
-  int row = blockIdx.x;
+
+  uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= N) return;
 
   float max_val = S[row * N];
   for (uint32_t col = 1; col < N; ++col)
@@ -33,10 +35,9 @@ void kernel_softmax(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Stage 1: Dense TCU S = Q·Kᵀ   (M=N_attn, N=N_attn, K=d_attn)
-// Mirrors tests/regression/sgemm_tcu/kernel.cpp verbatim.
+// Stage 1: Dense TCU S = Q·Kᵀ  — one output tile per 2D block.
 // =============================================================================
-void kernel_qk_tcu(kernel_arg_t* __UNIFORM__ arg) {
+static inline void qk_tcu_body(kernel_arg_t* arg) {
   auto pA = reinterpret_cast<tcu_ctx::input_t*>(arg->Q_addr);
   auto pB = reinterpret_cast<tcu_ctx::input_t*>(arg->K_addr);
   auto pC = reinterpret_cast<tcu_ctx::output_t*>(arg->S_addr);
@@ -65,9 +66,9 @@ void kernel_qk_tcu(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Stage 3: Dense TCU O = P·V   (M=N_attn, N=d_attn, K=N_attn)
+// Stage 3: Dense TCU O = P·V
 // =============================================================================
-void kernel_pv_tcu(kernel_arg_t* __UNIFORM__ arg) {
+static inline void pv_tcu_body(kernel_arg_t* arg) {
   auto pA = reinterpret_cast<tcu_ctx::input_t*>(arg->P_addr);
   auto pB = reinterpret_cast<tcu_ctx::input_t*>(arg->V_addr);
   auto pC = reinterpret_cast<tcu_ctx::output_t*>(arg->O_addr);
@@ -96,31 +97,20 @@ void kernel_pv_tcu(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Entry point
-// =============================================================================
-int main() {
-  kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-  uint64_t t_begin = vx_rdcycle();
-  int rc = 0;
+__kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
 
   switch (arg->kernel_id) {
-    case KID_QK_TCU:
-      rc = vx_spawn_threads(2, arg->grid_dim, arg->block_dim,
-                            (vx_kernel_func_cb)kernel_qk_tcu, arg);
-      break;
-    case KID_SOFTMAX:
-      rc = vx_spawn_threads(1, arg->grid_dim, nullptr,
-                            (vx_kernel_func_cb)kernel_softmax, arg);
-      break;
-    case KID_PV_TCU:
-      rc = vx_spawn_threads(2, arg->grid_dim, arg->block_dim,
-                            (vx_kernel_func_cb)kernel_pv_tcu, arg);
-      break;
-    default:
-      return -1;
+    case KID_QK_TCU:  qk_tcu_body(arg);  break;
+    case KID_SOFTMAX: softmax_body(arg); break;
+    case KID_PV_TCU:  pv_tcu_body(arg);  break;
+    default: break;
   }
 
-  uint64_t t_end = vx_rdcycle();
-  arg->kernel_cycles = t_end - t_begin;
-  return rc;
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
+  }
 }

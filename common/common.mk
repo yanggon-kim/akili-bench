@@ -18,6 +18,11 @@ XRT_DEVICE_INDEX ?= 0
 VORTEX_RT_PATH ?= $(VORTEX_BUILD)/runtime
 VORTEX_KN_PATH ?= $(VORTEX_BUILD)/kernel
 
+# Kernel runtime library selection.
+#   KERNEL_LIB ?= vortex   → legacy vx_spawn.h + int main() kernels
+#   KERNEL_LIB := vortex2  → KMU-based vx_spawn2.h + __kernel kernel_main
+KERNEL_LIB ?= vortex
+
 ifeq ($(XLEN),64)
 	ifeq ($(EXT_V_ENABLE),1)
 		VX_CFLAGS += -march=rv64imafdv_zve64d -mabi=lp64d
@@ -54,7 +59,12 @@ VX_CFLAGS += $(CONFIGS)
 VX_LIBS += -L$(LIBC_VORTEX)/lib -lm -lc
 VX_LIBS += $(LIBCRT_VORTEX)/lib/baremetal/libclang_rt.builtins-riscv$(XLEN).a
 
-VX_LDFLAGS += -Wl,-Bstatic,--gc-sections,-T,$(VORTEX_HOME)/kernel/scripts/link$(XLEN).ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR) $(VORTEX_KN_PATH)/libvortex.a $(VX_LIBS)
+VX_LDFLAGS += -Wl,-Bstatic,--gc-sections,-T,$(VORTEX_HOME)/kernel/scripts/link$(XLEN).ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR) $(VORTEX_KN_PATH)/lib$(KERNEL_LIB).a $(VX_LIBS)
+
+VX_STARTUP_SRC := $(VORTEX_HOME)/kernel/src/vx_start.S
+VX_KMU_FLAG    := $(if $(filter vortex2,$(KERNEL_LIB)),-DKMU_ENABLE)
+VX_APP_OBJS    = $(addsuffix .o, $(basename $(notdir $(VX_SRCS))))
+KERNEL_STARTUP := $(VORTEX_HOME)/kernel/scripts/kernel_startup.sh
 
 CXXFLAGS += -std=c++17 -Wall -Wextra -pedantic -Wfatal-errors
 CXXFLAGS += -I$(VORTEX_HOME)/runtime/include -I$(VORTEX_BUILD)/hw -I$(SW_COMMON_DIR)
@@ -90,8 +100,22 @@ kernel.dump: kernel.elf
 kernel.vxbin: kernel.elf
 	OBJCOPY=$(VX_CP) $(VORTEX_HOME)/kernel/scripts/vxbin.py $< $@
 
+ifeq ($(KERNEL_LIB),vortex2)
+# Two-pass build for KMU kernels: detect startup feature flags from a
+# probe-linked ELF so vx_start.S is compiled with the right set of
+# -DNEED_GP / -DNEED_TLS / -DNEED_INITFINI.
+vx_start.o: $(VX_SRCS)
+	$(VX_CXX) $(VX_CFLAGS) -c $(VX_SRCS)
+	$(VX_CXX) $(VX_CFLAGS) -DNEED_GP -DNEED_TLS -DNEED_INITFINI $(VX_KMU_FLAG) -c $(VX_STARTUP_SRC) -o $@
+	$(VX_CXX) $(VX_CFLAGS) $@ $(VX_APP_OBJS) $(VX_LDFLAGS) -o $@.elf
+	$(VX_CXX) $(VX_CFLAGS) $$($(KERNEL_STARTUP) $(VX_DP) $@.elf) $(VX_KMU_FLAG) -c $(VX_STARTUP_SRC) -o $@ && rm -f $@.elf
+
+kernel.elf: vx_start.o $(VX_SRCS)
+	$(VX_CXX) $(VX_CFLAGS) vx_start.o $(VX_APP_OBJS) $(VX_LDFLAGS) -o $@
+else
 kernel.elf: $(VX_SRCS)
 	$(VX_CXX) $(VX_CFLAGS) $^ $(VX_LDFLAGS) -o kernel.elf
+endif
 
 $(PROJECT): $(SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@

@@ -162,6 +162,7 @@ vx_buffer_h act_a_buf = nullptr, act_b_buf = nullptr;
 vx_buffer_h scratch_fp32_buf = nullptr;
 vx_buffer_h out_head_fp32_buf = nullptr;
 vx_buffer_h sigma_buf = nullptr, rgb_buf = nullptr, image_buf = nullptr;
+vx_buffer_h cycles_buffer = nullptr;
 vx_buffer_h krnl_buffer = nullptr;
 vx_buffer_h args_buffer = nullptr;
 kernel_arg_t kernel_arg = {};
@@ -212,19 +213,21 @@ void cleanup() {
     if (sigma_buf) vx_mem_free(sigma_buf);
     if (rgb_buf)   vx_mem_free(rgb_buf);
     if (image_buf) vx_mem_free(image_buf);
+    if (cycles_buffer) vx_mem_free(cycles_buffer);
     if (krnl_buffer) vx_mem_free(krnl_buffer);
     if (args_buffer) vx_mem_free(args_buffer);
     vx_dev_close(device);
   }
 }
 
-static uint64_t read_back_cycles_tag(const char* tag, bool print) {
-  kernel_arg_t back = {};
-  vx_copy_from_dev(&back, args_buffer, 0, sizeof(kernel_arg_t));
+static uint64_t read_back_cycles_tag(const char* tag, uint32_t num_blocks, bool print) {
+  std::vector<uint32_t> h_cycles(num_blocks, 0);
+  vx_copy_from_dev(h_cycles.data(), cycles_buffer, 0, num_blocks * sizeof(uint32_t));
+  uint32_t max_cyc = 0;
+  for (auto c : h_cycles) if (c > max_cyc) max_cyc = c;
   if (print)
-    printf("KCYC[%s,nt=%u]: %lu\n",
-           tag, (unsigned)NUM_THREADS, (unsigned long)back.kernel_cycles);
-  return (uint64_t)back.kernel_cycles;
+    printf("KCYC[%s,nt=%u]: %u\n", tag, (unsigned)NUM_THREADS, max_cyc);
+  return (uint64_t)max_cyc;
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +405,25 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_mem_alloc(device, sizeof(kernel_arg_t), VX_MEM_READ_WRITE, &args_buffer));
 
+  // Per-stage grid/block shapes. Largest grid sizes the cycle buffer.
+  uint32_t gd_setup      = (n_points + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t gd_gemm_x     = n_points / TN;
+  uint32_t gd_gemm_y_max = MLP_W / TM;  // layers 0..2 have N_out = MLP_W
+  uint32_t gd_gemm_blocks_max = gd_gemm_x * gd_gemm_y_max;
+  uint32_t gd_act_max    = (MLP_W * n_points + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t gd_out_act    = (n_points + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t gd_comp       = (n_rays   + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t max_blocks    = gd_setup;
+  if (gd_gemm_blocks_max > max_blocks) max_blocks = gd_gemm_blocks_max;
+  if (gd_act_max > max_blocks) max_blocks = gd_act_max;
+  if (gd_out_act > max_blocks) max_blocks = gd_out_act;
+  if (gd_comp    > max_blocks) max_blocks = gd_comp;
+  RT_CHECK(vx_mem_alloc(device, max_blocks * sizeof(uint32_t),
+                        VX_MEM_READ_WRITE, &cycles_buffer));
+  RT_CHECK(vx_mem_address(cycles_buffer, &kernel_arg.cycles_addr));
+
+  uint32_t block_dim[2] = {NUM_THREADS, 1};
+
   int errors = 0;
   const float atol = 1e-2f;
   const float rtol = 1e-2f;
@@ -412,9 +434,12 @@ int main(int argc, char* argv[]) {
   std::cout << "=== Stage 1: ray setup + positional encoding ===" << std::endl;
   kernel_arg.kernel_id = KID_RAY_SETUP;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+  {
+    uint32_t grid_dim[2] = {gd_setup, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
+  }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  cyc_setup = read_back_cycles_tag("SETUP", true);
+  cyc_setup = read_back_cycles_tag("SETUP", gd_setup, true);
 
   // Readback PE features + deltas and verify against CPU
   std::vector<uint16_t> h_pe_fp16(MLP_IN_DIM_PAD * n_points);
@@ -497,18 +522,18 @@ int main(int argc, char* argv[]) {
     kernel_arg.K_in_cur     = p.K_in;
     kernel_arg.N_out_cur    = p.N_out;
     kernel_arg.layer_idx    = L;
-    kernel_arg.grid_dim[0]  = n_points / TN;
-    kernel_arg.grid_dim[1]  = p.N_out / TM;
-    kernel_arg.block_dim[0] = NUM_THREADS;
-    kernel_arg.block_dim[1] = 1;
     kernel_arg.kernel_id    = KID_MLP_GEMM;
     RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-    RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+    {
+      uint32_t grid_dim[2] = {n_points / TN, p.N_out / TM};
+      RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, 0));
+    }
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
     {
       char tag[32];
       std::snprintf(tag, sizeof(tag), "MLP_L%u_GEMM", (unsigned)L);
-      cyc_mlp_gemm += read_back_cycles_tag(tag, true);
+      uint32_t nb = (n_points / TN) * (p.N_out / TM);
+      cyc_mlp_gemm += read_back_cycles_tag(tag, nb, true);
     }
 
     // CPU reference: Y = W * X (fp32)
@@ -544,12 +569,17 @@ int main(int argc, char* argv[]) {
       // Hidden layer: ReLU + bias + fp16 cast
       kernel_arg.kernel_id = KID_MLP_ACT;
       RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-      RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+      uint32_t nt_act = p.N_out * n_points;
+      uint32_t nb_act = (nt_act + NUM_THREADS - 1) / NUM_THREADS;
+      {
+        uint32_t grid_dim[2] = {nb_act, 1};
+        RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
+      }
       RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
       {
         char tag[32];
         std::snprintf(tag, sizeof(tag), "MLP_L%u_ACT", (unsigned)L);
-        cyc_mlp_act += read_back_cycles_tag(tag, true);
+        cyc_mlp_act += read_back_cycles_tag(tag, nb_act, true);
       }
       // Update cpu_X = ReLU(Y + B)
       cpu_X.assign(p.N_out * n_points, 0.0f);
@@ -564,9 +594,13 @@ int main(int argc, char* argv[]) {
       // Layer 3: softplus/sigmoid → sigmas/rgbs
       kernel_arg.kernel_id = KID_MLP_OUT_ACT;
       RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-      RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+      uint32_t nb_oa = (n_points + NUM_THREADS - 1) / NUM_THREADS;
+      {
+        uint32_t grid_dim[2] = {nb_oa, 1};
+        RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
+      }
       RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-      cyc_mlp_act += read_back_cycles_tag("MLP_OUT_ACT", true);
+      cyc_mlp_act += read_back_cycles_tag("MLP_OUT_ACT", nb_oa, true);
     }
   }
 
@@ -606,9 +640,12 @@ int main(int argc, char* argv[]) {
   std::cout << "=== Stage 3: alpha compositing ===" << std::endl;
   kernel_arg.kernel_id = KID_COMPOSITE;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+  {
+    uint32_t grid_dim[2] = {gd_comp, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
+  }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  cyc_comp = read_back_cycles_tag("COMP", true);
+  cyc_comp = read_back_cycles_tag("COMP", gd_comp, true);
 
   std::vector<float> h_image(n_rays * 3);
   RT_CHECK(vx_copy_from_dev(h_image.data(), image_buf, 0, image_bytes));

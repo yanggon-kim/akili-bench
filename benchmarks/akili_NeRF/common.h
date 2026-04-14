@@ -47,8 +47,8 @@ typedef struct {
   // Stage 3 output
   uint64_t image_addr;       // float[n_rays*3]
 
-  // Per-stage cycle count written by device main()
-  uint64_t kernel_cycles;
+  // Per-CTA cycle count buffer (uint32_t[num_blocks_max])
+  uint64_t cycles_addr;
 
   uint32_t n_rays;
   uint32_t n_samples;

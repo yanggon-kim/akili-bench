@@ -50,12 +50,10 @@ typedef struct {
   // ---- Stage 3 output ----
   uint64_t image_addr;         // float[n_rays * 3]
 
-  // ---- Per-stage cycle count written by device main() ----
-  uint64_t kernel_cycles;
+  // ---- Per-CTA cycle buffer (uint32_t[num_blocks_max]) ----
+  uint64_t cycles_addr;
 
-  // ---- TCU dispatch geometry ----
-  uint32_t grid_dim[2];        // 2D for TCU GEMM, 1D for SIMT kernels
-  uint32_t block_dim[2];
+  // ---- Per-layer GEMM scalars ----
   uint32_t K_in_cur;           // GEMM K = input feature count
   uint32_t N_out_cur;          // GEMM M = output feature count
 
@@ -66,7 +64,6 @@ typedef struct {
   float    min_near;
   uint32_t layer_idx;          // 0..3, used by ACT to pick activation shape
   uint32_t kernel_id;
-  uint32_t _pad;
 } kernel_arg_t;
 
 #endif

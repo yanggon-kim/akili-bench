@@ -1,37 +1,48 @@
-#include <vx_spawn.h>
+#include <vx_spawn2.h>
 #include <vx_intrinsics.h>
 #include <vx_tensor.h>
 #include <math.h>
 #include "common.h"
 
 // =============================================================================
-// akili_NeRF_tcu — Full NeRF forward pass with TCU-accelerated MLP.
+// akili_NeRF_tcu — Full NeRF forward pass with TCU-accelerated MLP on the KMU
+// launch API. One __kernel entry point dispatches 5 stages via arg->kernel_id.
 //
-//   Stage 1 (SIMT):  ray-AABB slab + stratified sampling + positional encoding
-//   Stage 2 (TCU):   4 layer GEMMs (W x X -> Y_fp32)   — dispatched 4x
-//   Stage 2 (SIMT):  ReLU + bias + fp32->fp16 cast     — dispatched 4x
-//                    (last layer uses KID_MLP_OUT_ACT = softplus+sigmoid)
-//   Stage 3 (SIMT):  per-ray alpha compositing
+//   KID_RAY_SETUP    : SIMT ray-AABB slab + stratified sampling + PE
+//   KID_MLP_GEMM     : dense TCU layer GEMM (2D tile grid)
+//   KID_MLP_ACT      : SIMT ReLU + bias + fp32->fp16 cast
+//   KID_MLP_OUT_ACT  : SIMT softplus(sigma) + sigmoid(rgb)
+//   KID_COMPOSITE    : SIMT per-ray alpha compositing
 // =============================================================================
 
 namespace vt = vortex::tensor;
 using tcu_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
 
+// fp32 -> fp16 (IEEE) packing helper.
+static inline uint16_t d_f2h(float x) {
+  uint32_t bits;
+  __builtin_memcpy(&bits, &x, sizeof(bits));
+  uint16_t sign = (uint16_t)((bits >> 16) & 0x8000);
+  uint16_t mant = (uint16_t)((bits >> 13) & 0x03FF);
+  int32_t  ex   = (int32_t)((bits >> 23) & 0xFF) - 127 + 15;
+  if (ex >= 31) return (uint16_t)(sign | 0x7C00);
+  if (ex <= 0)  return sign;
+  return (uint16_t)(sign | ((uint16_t)ex << 10) | mant);
+}
+
 // -----------------------------------------------------------------------------
-// Stage 1: ray setup + positional encoding.
-// One task per POINT (flat n_rays*n_samples tasks) so the strided writes to
-// pe_buf are cache-friendly: within each warp, lane l writes feature f for
-// point (warp_base + l) — 8 contiguous fp16 values per cache line.
-// Writes PE features into pe_buf in [32 x n_points] row-major layout.
+// Stage 1: ray setup + positional encoding (SIMT, one task per point).
 // -----------------------------------------------------------------------------
-void kernel_ray_setup(kernel_arg_t* __UNIFORM__ arg) {
+static inline void ray_setup_body(kernel_arg_t* arg) {
   auto rays_o  = reinterpret_cast<float*>(arg->rays_o_addr);
   auto rays_d  = reinterpret_cast<float*>(arg->rays_d_addr);
   auto aabb    = reinterpret_cast<float*>(arg->aabb_addr);
   auto pe_out  = reinterpret_cast<uint16_t*>(arg->pe_buf_addr);
   auto dlt_out = reinterpret_cast<float*>(arg->deltas_addr);
 
-  uint32_t pt     = blockIdx.x;                // flat point index
+  uint32_t pt = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pt >= arg->n_points) return;
+
   uint32_t S      = arg->n_samples;
   uint32_t n_pts  = arg->n_points;
   uint32_t ray    = pt / S;
@@ -67,49 +78,28 @@ void kernel_ray_setup(kernel_arg_t* __UNIFORM__ arg) {
   float pz = oz + t * dz;
   dlt_out[pt] = step;
 
-  // Device-side fp32 -> fp16 (IEEE) packing. Same bit tricks as f2h_host.
-  auto f2h = [](float x) -> uint16_t {
-    uint32_t bits;
-    __builtin_memcpy(&bits, &x, sizeof(bits));
-    uint16_t sign = (uint16_t)((bits >> 16) & 0x8000);
-    uint16_t mant = (uint16_t)((bits >> 13) & 0x03FF);
-    int32_t  ex   = (int32_t)((bits >> 23) & 0xFF) - 127 + 15;
-    if (ex >= 31) return (uint16_t)(sign | 0x7C00);
-    if (ex <= 0)  return sign;
-    return (uint16_t)(sign | ((uint16_t)ex << 10) | mant);
-  };
-
-  // Feature-major layout: pe_out[f * n_pts + pt].
-  // Within a warp, consecutive lanes write consecutive `pt` at the same
-  // feature row → 8 contiguous fp16 = 16 bytes into one cache line.
-  pe_out[0 * n_pts + pt] = f2h(px);
-  pe_out[1 * n_pts + pt] = f2h(py);
-  pe_out[2 * n_pts + pt] = f2h(pz);
+  pe_out[0 * n_pts + pt] = d_f2h(px);
+  pe_out[1 * n_pts + pt] = d_f2h(py);
+  pe_out[2 * n_pts + pt] = d_f2h(pz);
   float freq = 1.0f;
   for (int L = 0; L < PE_L; ++L) {
     uint32_t base = 3 + L*6;
-    pe_out[(base+0) * n_pts + pt] = f2h(sinf(freq * px));
-    pe_out[(base+1) * n_pts + pt] = f2h(cosf(freq * px));
-    pe_out[(base+2) * n_pts + pt] = f2h(sinf(freq * py));
-    pe_out[(base+3) * n_pts + pt] = f2h(cosf(freq * py));
-    pe_out[(base+4) * n_pts + pt] = f2h(sinf(freq * pz));
-    pe_out[(base+5) * n_pts + pt] = f2h(cosf(freq * pz));
+    pe_out[(base+0) * n_pts + pt] = d_f2h(sinf(freq * px));
+    pe_out[(base+1) * n_pts + pt] = d_f2h(cosf(freq * px));
+    pe_out[(base+2) * n_pts + pt] = d_f2h(sinf(freq * py));
+    pe_out[(base+3) * n_pts + pt] = d_f2h(cosf(freq * py));
+    pe_out[(base+4) * n_pts + pt] = d_f2h(sinf(freq * pz));
+    pe_out[(base+5) * n_pts + pt] = d_f2h(cosf(freq * pz));
     freq *= 2.0f;
   }
-  // Pad feature rows 27..31 with zero so layer 0's K-loop is clean.
   for (uint32_t f = MLP_IN_DIM; f < MLP_IN_DIM_PAD; ++f)
     pe_out[f * n_pts + pt] = 0;
 }
 
 // -----------------------------------------------------------------------------
-// Stage 2: dense TCU MLP layer (one 2D grid block per output tile).
-//   C = A * B  where:
-//     A = W [N_out x K_in] row-major  (default row-major load)
-//     B = X [K_in x n_points] row-major  (default row-major load)
-//     C = Y [N_out x n_points] row-major store
-// Grid: (n_points / tileN, N_out / tileM)
+// Stage 2: dense TCU MLP layer (2D tile grid).
 // -----------------------------------------------------------------------------
-void kernel_mlp_gemm(kernel_arg_t* __UNIFORM__ arg) {
+static inline void mlp_gemm_body(kernel_arg_t* arg) {
   auto pA = reinterpret_cast<tcu_ctx::input_t*>(arg->W_cur_addr);
   auto pB = reinterpret_cast<tcu_ctx::input_t*>(arg->X_cur_addr);
   auto pC = reinterpret_cast<tcu_ctx::output_t*>(arg->Y_cur_addr);
@@ -121,8 +111,8 @@ void kernel_mlp_gemm(kernel_arg_t* __UNIFORM__ arg) {
   tcu_ctx::fragment_b   fragB;
   tcu_ctx::fragment_acc fragC;
 
-  uint32_t tile_row = blockIdx.y * tcu_ctx::tileM;  // output row start
-  uint32_t tile_col = blockIdx.x * tcu_ctx::tileN;  // point col start
+  uint32_t tile_row = blockIdx.y * tcu_ctx::tileM;
+  uint32_t tile_col = blockIdx.x * tcu_ctx::tileN;
   tcu_ctx::fill_fragment(fragC, 0);
 
   for (int i = 0; i < (int)K_in; i += (int)tcu_ctx::tileK) {
@@ -138,50 +128,39 @@ void kernel_mlp_gemm(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // -----------------------------------------------------------------------------
-// Stage 2: SIMT activation + bias + fp32->fp16 cast for hidden layers.
-// One task per (n_out_row, point) flat index. Grid = N_out * n_points.
+// Stage 2: SIMT hidden-layer activation (ReLU + bias + fp32→fp16).
 // -----------------------------------------------------------------------------
-void kernel_mlp_act(kernel_arg_t* __UNIFORM__ arg) {
+static inline void mlp_act_body(kernel_arg_t* arg) {
   auto pY_fp32 = reinterpret_cast<float*>(arg->Y_cur_addr);
   auto pB      = reinterpret_cast<float*>(arg->B_cur_addr);
   auto pOut    = reinterpret_cast<uint16_t*>(arg->act_out_addr);
 
-  uint32_t tid = blockIdx.x;
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t total = arg->N_out_cur * arg->n_points;
+  if (tid >= total) return;
+
   uint32_t n_pts = arg->n_points;
   uint32_t row = tid / n_pts;
   uint32_t col = tid - row * n_pts;
 
   float v = pY_fp32[row * n_pts + col] + pB[row];
   if (v < 0.0f) v = 0.0f;
-
-  // fp32 -> fp16
-  uint32_t bits;
-  __builtin_memcpy(&bits, &v, sizeof(bits));
-  uint16_t sign = (uint16_t)((bits >> 16) & 0x8000);
-  uint16_t mant = (uint16_t)((bits >> 13) & 0x03FF);
-  int32_t  ex   = (int32_t)((bits >> 23) & 0xFF) - 127 + 15;
-  uint16_t h;
-  if (ex >= 31)      h = (uint16_t)(sign | 0x7C00);
-  else if (ex <= 0)  h = sign;
-  else               h = (uint16_t)(sign | ((uint16_t)ex << 10) | mant);
-  pOut[row * n_pts + col] = h;
+  pOut[row * n_pts + col] = d_f2h(v);
 }
 
 // -----------------------------------------------------------------------------
-// Stage 2 final: softplus(sigma logit) + sigmoid(rgb logits).
-// Runs after layer 3's TCU GEMM.  One task per point.
-// Layer 3 Y has shape [MLP_OUT_DIM_PAD x n_points] row-major; row 0 is
-// sigma logit, rows 1-3 are RGB logits.
+// Stage 2 final: softplus(sigma) + sigmoid(rgb) (SIMT, one task per point).
 // -----------------------------------------------------------------------------
-void kernel_mlp_out_act(kernel_arg_t* __UNIFORM__ arg) {
+static inline void mlp_out_act_body(kernel_arg_t* arg) {
   auto pY_fp32 = reinterpret_cast<float*>(arg->Y_cur_addr);
   auto pB      = reinterpret_cast<float*>(arg->B_cur_addr);
   auto pSig    = reinterpret_cast<float*>(arg->sigmas_addr);
   auto pRGB    = reinterpret_cast<float*>(arg->rgbs_addr);
 
-  uint32_t tid = blockIdx.x;
-  uint32_t n_pts = arg->n_points;
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= arg->n_points) return;
 
+  uint32_t n_pts = arg->n_points;
   float s  = pY_fp32[0 * n_pts + tid] + pB[0];
   float r  = pY_fp32[1 * n_pts + tid] + pB[1];
   float g  = pY_fp32[2 * n_pts + tid] + pB[2];
@@ -193,16 +172,17 @@ void kernel_mlp_out_act(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // -----------------------------------------------------------------------------
-// Stage 3: SIMT alpha compositing (one task per ray).  Same math as the
-// SIMT baseline kernel2_body.
+// Stage 3: SIMT alpha compositing (one task per ray).
 // -----------------------------------------------------------------------------
-void kernel_composite(kernel_arg_t* __UNIFORM__ arg) {
+static inline void composite_body(kernel_arg_t* arg) {
   auto sigmas = reinterpret_cast<float*>(arg->sigmas_addr);
   auto rgbs   = reinterpret_cast<float*>(arg->rgbs_addr);
   auto deltas = reinterpret_cast<float*>(arg->deltas_addr);
   auto image  = reinterpret_cast<float*>(arg->image_addr);
 
-  uint32_t ray = blockIdx.x;
+  uint32_t ray = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ray >= arg->n_rays) return;
+
   uint32_t S   = arg->n_samples;
   uint32_t base = ray * S;
 
@@ -224,50 +204,24 @@ void kernel_composite(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Entry point — one spawn per stage, cycles recorded via vx_rdcycle().
+// KMU kernel entry
 // =============================================================================
-int main() {
-  kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-
-  uint64_t t_begin = vx_rdcycle();
-  int rc = 0;
-  uint32_t n_tasks;
+__kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
 
   switch (arg->kernel_id) {
-    case KID_RAY_SETUP:
-      n_tasks = arg->n_points;  // one task per point for cache-friendly writes
-      rc = vx_spawn_threads(1, &n_tasks, nullptr,
-                            (vx_kernel_func_cb)kernel_ray_setup, arg);
-      break;
-
-    case KID_MLP_GEMM:
-      rc = vx_spawn_threads(2, arg->grid_dim, arg->block_dim,
-                            (vx_kernel_func_cb)kernel_mlp_gemm, arg);
-      break;
-
-    case KID_MLP_ACT:
-      n_tasks = arg->N_out_cur * arg->n_points;
-      rc = vx_spawn_threads(1, &n_tasks, nullptr,
-                            (vx_kernel_func_cb)kernel_mlp_act, arg);
-      break;
-
-    case KID_MLP_OUT_ACT:
-      n_tasks = arg->n_points;
-      rc = vx_spawn_threads(1, &n_tasks, nullptr,
-                            (vx_kernel_func_cb)kernel_mlp_out_act, arg);
-      break;
-
-    case KID_COMPOSITE:
-      n_tasks = arg->n_rays;
-      rc = vx_spawn_threads(1, &n_tasks, nullptr,
-                            (vx_kernel_func_cb)kernel_composite, arg);
-      break;
-
-    default:
-      return -1;
+    case KID_RAY_SETUP:    ray_setup_body(arg);    break;
+    case KID_MLP_GEMM:     mlp_gemm_body(arg);     break;
+    case KID_MLP_ACT:      mlp_act_body(arg);      break;
+    case KID_MLP_OUT_ACT:  mlp_out_act_body(arg);  break;
+    case KID_COMPOSITE:    composite_body(arg);    break;
+    default: break;
   }
 
-  uint64_t t_end = vx_rdcycle();
-  arg->kernel_cycles = t_end - t_begin;
-  return rc;
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
+  }
 }
