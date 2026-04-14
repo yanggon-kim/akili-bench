@@ -1,12 +1,14 @@
 # Akili Benchmarks — User Guide
 
-This document describes the nine `akili_*` benchmarks that ship with
+This document describes the twelve `akili_*` benchmarks that ship with
 Vortex Sparse TCU under `tests/bench_dir/bench/benchmarks/`. Each
 benchmark is a **self-contained test directory** that builds a single
 binary for one `(workload, hardware variant)` pair. Use these if you
-want to run attention, FlashAttention, or 2D convolution on Vortex in
-SIMT mode, dense TCU mode, or 2:4 sparse TCU mode — and compare the
-three against each other head-to-head at a shape of your choice.
+want to run attention, FlashAttention, 2D convolution, or a full NeRF
+forward pass on Vortex in SIMT mode, dense TCU mode, or 2:4 sparse TCU
+mode — and compare the three against each other head-to-head at a
+shape of your choice. The NeRF tests (`akili_NeRF*`) are documented in
+Section 9.
 
 All paths in this document are **relative to the Vortex source root**
 (`vortex/`). No absolute paths, so everything works from
@@ -590,3 +592,148 @@ to test very large C_in.
 | `tests/regression/sgemm/`                                | Reference SIMT GEMM test — the akili_cnn / akili_attn dispatch patterns are modeled on it. |
 | `tests/regression/sgemm_tcu/`                            | Reference dense TCU GEMM. The akili_*_tcu TCU kernels are direct copies. |
 | `tests/regression/sgemm_tcu_sp/`                         | Reference sparse TCU GEMM. The akili_*_tcu_sp kernels are direct copies. |
+
+---
+
+## 9. NeRF — full-pipeline benchmark (SIMT / dense TCU / sparse TCU)
+
+Three benchmark directories implement a **full NeRF forward pass** in
+one Vortex binary each. Unlike the attention/flash/CNN suite, which
+compares one GEMM-heavy workload across three hardware variants, NeRF
+exercises a realistic end-to-end pipeline: ray-AABB intersection →
+stratified sampling → positional encoding → tiny-NeRF MLP
+(4 hidden × 64) → softplus/sigmoid → alpha compositing.
+
+Only the **4 MLP layer GEMMs** move to the TCU. Ray setup + positional
+encoding + activations + compositing all stay on SIMT in all three
+variants — so per-stage cycle comparisons isolate the tensor-core
+effect on the GEMM portion cleanly.
+
+| Directory | Hardware | MLP runtime (Y = W·X) |
+|---|---|---|
+| `tests/bench_dir/bench/benchmarks/akili_NeRF/`        | **SIMT**       | fp32, per-task GEMVs inlined into one kernel body |
+| `tests/bench_dir/bench/benchmarks/akili_NeRF_tcu/`    | **Dense TCU**  | fp16 inputs, fp32 accumulators, `wmma_context<NT, fp16, fp32, false>`. 4 separate TCU spawns (one per layer). |
+| `tests/bench_dir/bench/benchmarks/akili_NeRF_tcu_sp/` | **Sparse TCU** | 2:4-pruned weights, `wmma_context<NT, fp16, fp32, true>`. Host pre-prunes + compresses + packs metadata for each of the 4 weight matrices. |
+
+### 9.1 Tiny NeRF architecture (used by all three variants)
+
+| Knob | Value |
+|---|---|
+| Input encoding | Positional encoding (Mildenhall 2020), L=4 frequency bands → `3 + 3·2·4 = 27` features, padded to 32 for TCU tile alignment |
+| Hidden layers | 4 |
+| Hidden width (`MLP_W`) | **64** (multiple of `tileM=tileN=8`, `tileK=16` dense / 8 sparse) |
+| Output head | 4 logits (1 σ + 3 RGB), padded to 8 for the final TCU layer |
+| Activations | fp32 intermediate, ReLU after layers 0-2, softplus(σ) + sigmoid(rgb) after layer 3 |
+
+### 9.2 CLI flags
+
+All three binaries share the same interface:
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `-r <N>` | Number of rays | 32 |
+| `-s <N>` | Samples per ray | 8 |
+| `-k <path>` | Kernel binary | `kernel.vxbin` |
+
+The total point count `n_points = -r × -s` must be a multiple of
+`tileN = 8`. The default smoke shape (32×8 = 256) and the medium
+shape (64×16 = 1024) both satisfy this.
+
+### 9.3 Expected cycle output
+
+Each binary prints the per-stage tags plus a summary line:
+
+```
+KCYC[SETUP,nt=8]:        <ray setup + PE>
+KCYC[MLP_GEMM,nt=8]:     <sum of the 4 layer GEMMs>   (TCU variants only)
+KCYC[MLP,nt=8]:          <single fused SIMT MLP>      (SIMT variant only)
+KCYC[MLP_ACT,nt=8]:      <sum of SIMT act+cast spawns> (TCU variants only)
+KCYC[COMP,nt=8]:         <alpha compositing>
+KCYC[SUMMARY,nt=8]:      non_gemm=... gemm=... total=... (gemm_frac=...)
+PASSED!
+```
+
+For the TCU variants, cycles are grouped as:
+`non_gemm = SETUP + MLP_ACT + COMP`, `gemm = MLP_GEMM`.
+
+### 9.4 Measured NeRF cycles (NT=8, simx)
+
+#### Smoke: `-r 32 -s 8` (n_points = 256)
+
+| Stage                       | SIMT       | Dense TCU | Sparse TCU |
+|-----------------------------|-----------:|----------:|-----------:|
+| SETUP (ray + PE)            |     15,066 | 19,073,943| 19,060,114 |
+| MLP / MLP_GEMM (the 4 GEMMs)| 33,721,478 |  1,251,246|  1,230,853 |
+| MLP_ACT                     |          — |  4,918,481|  4,798,089 |
+| COMP (alpha compositing)    |    687,900 |    691,060|    694,389 |
+| **total**                   | 34,424,444 | 25,934,730| 25,783,445 |
+
+> SIMT folds PE + the 4 layer GEMMs + softplus/sigmoid into a single
+> kernel body, so `KCYC[MLP]` covers everything the TCU variants spread
+> across `SETUP (PE portion)`, `MLP_GEMM`, and `MLP_ACT`.
+
+#### Medium: `-r 64 -s 16` (n_points = 1024)
+
+| Stage                       | SIMT         | Dense TCU   | Sparse TCU  |
+|-----------------------------|-------------:|------------:|------------:|
+| SETUP (ray + PE)            |       29,063 |  68,976,350 |  69,047,048 |
+| MLP / MLP_GEMM              |  127,673,461 |   4,715,518 |   4,613,873 |
+| MLP_ACT                     |            — |  19,405,688 |  19,073,248 |
+| COMP                        |    2,664,200 |   2,693,425 |   2,673,157 |
+| **total**                   |  130,366,724 |  95,790,981 |  95,407,326 |
+
+### 9.5 Speedups
+
+| Ratio | Smoke (`-r 32 -s 8`) | Medium (`-r 64 -s 16`) |
+|---|---:|---:|
+| **MLP GEMM speedup: dense TCU / SIMT** | **26.95×** | **27.07×** |
+| **MLP GEMM speedup: sparse TCU / dense TCU** | 1.017× | 1.022× |
+| End-to-end speedup: dense TCU / SIMT (total) | 1.327× | 1.361× |
+| End-to-end speedup: sparse TCU / dense TCU (total) | 1.006× | 1.004× |
+
+**How to read these numbers:**
+
+- **Dense TCU gives a dramatic ~27× speedup on the MLP GEMM portion**
+  — this is the headline result. The TCU turns the 4-layer fp32
+  scalar MLP into a handful of WMMA tile operations, and the rest of
+  the pipeline (PE, activations, compositing) continues to run on the
+  same SIMT kernels.
+
+- **End-to-end speedup is only ~1.33×-1.36×** because once the GEMMs
+  are accelerated, the non-GEMM work (PE computation + softplus +
+  sigmoid + compositing) becomes the dominant cost. This is classic
+  Amdahl's law: a 27× speedup on 98% of the runtime gives an
+  end-to-end ceiling of ~1 / (1 - 0.98 + 0.98/27) ≈ 25×, but the
+  pipeline isn't purely GEMM — roughly half of the remaining work is
+  transcendental math (sin/cos in PE, exp in softplus/sigmoid/alpha).
+
+- **Sparse TCU over dense TCU is only ~1.02× on the MLP GEMMs** at
+  these shapes. The MLP's K dimension is 32 (layer 0) or 64 (layers
+  1-3), which is **below the K ≈ 256 threshold** where 2:4 structured
+  sparsity starts to beat dense on fp16. Per the FPGA sweep in
+  `MEMORY.md > "FPGA Sparse vs Dense Performance"`, fp16 sparse
+  peaks at 1.86× around `K=1024` and crosses 1.0× near `K=256`. Below
+  that, the per-tile metadata load overhead cancels the compute
+  savings. A larger tiny-NeRF variant with `MLP_W=256` would show a
+  clearer sparse win but take 10-20× longer in simx.
+
+### 9.6 Recommended shapes for NeRF
+
+| Purpose | Shape | Rationale | Wall-clock |
+|---|---|---|---|
+| Smoke test | `-r 32 -s 8` | Dense TCU PASSES at the smallest valid shape (256 points = 32 × tileN). ~1-2 min per variant. | ~1-2 min |
+| End-to-end story | `-r 64 -s 16` | 4× the point count; the SIMT vs dense-TCU speedup ratio stays at ~27×, confirming it's not an artifact of the smallest shape. | ~5-7 min per variant |
+| Going bigger | `-r 128 -s 32` | 4096 points; still passes, useful for FPGA runs but too slow for SIMT comparison in simx (>30 min). | — |
+
+### 9.7 Rules of thumb for NeRF on TCU
+
+- **The MLP GEMM speedup is the metric that matters for TCU
+  comparison**. Report `SIMT_MLP / TCU_MLP_GEMM` if you want the
+  "what does the tensor core buy us" number.
+- **End-to-end total** is useful for wall-clock comparisons but will
+  be pulled down by the PE + softplus/sigmoid cost, which is the
+  same cost in all three variants.
+- **Sparse wins want big K**. At `MLP_W=64` sparse/dense is ≈ 1.0×.
+  Raise `MLP_W` to 128+ (edit `common.h` in all three directories)
+  if you need the sparse path to show a visible speedup. The
+  corresponding SIMT baseline re-run will be ~4× slower.

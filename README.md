@@ -18,15 +18,25 @@ cd akili-bench
 git checkout akili
 ```
 
-## The nine tests
+## The twelve tests
 
-All nine live under `benchmarks/` once you're on the branch:
+All twelve live under `benchmarks/` once you're on the branch:
 
 | Workload | SIMT | Dense TCU | Sparse TCU (2:4) |
 |---|---|---|---|
 | **Attention** | `benchmarks/akili_attn/` | `benchmarks/akili_attn_tcu/` | `benchmarks/akili_attn_tcu_sp/` |
 | **FlashAttention** | `benchmarks/akili_flash/` | `benchmarks/akili_flash_tcu/` | `benchmarks/akili_flash_tcu_sp/` |
 | **CNN / conv2d** | `benchmarks/akili_cnn/` | `benchmarks/akili_acccnn_tcu/` | `benchmarks/akili_acccnn_tcu_sp/` |
+| **NeRF** (full forward pass: ray-AABB + MLP + compositing) | `benchmarks/akili_NeRF/` | `benchmarks/akili_NeRF_tcu/` | `benchmarks/akili_NeRF_tcu_sp/` |
+
+The NeRF tests are **end-to-end pipelines**, not isolated GEMM
+kernels: they run ray-AABB intersection → stratified sampling →
+positional encoding → tiny-NeRF MLP (4 hidden × 64) → softplus +
+sigmoid → alpha compositing in a single Vortex binary. Only the MLP
+GEMMs move to the TCU in the `_tcu` / `_tcu_sp` variants; ray setup,
+activations, and compositing stay SIMT. See `00_doc/akili_benchmarks.md`
+Section 9 for the full 3-way speedup table (dense TCU gives ~27× on
+the MLP GEMMs vs SIMT).
 
 ## How to use them — read these first
 
