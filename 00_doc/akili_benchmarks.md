@@ -292,6 +292,89 @@ simulator wall-clock on a modern host.
 
 ### Best configurations (sweet spots)
 
+#### Hardware configuration used for these measurements
+
+**The sweet spots below are specific to the Vortex hardware
+configuration listed here.** Change any of these and the best
+shapes may shift — cache size and the number of warps / banks
+affect where the softmax anchor, memory pressure, and TCU tile
+throughput cross over. If you're running on a different Vortex
+build (more cores, bigger L1, L2 enabled, different warp width),
+re-run the sweep.
+
+| Knob | Value | Where it's set |
+|---|---|---|
+| Driver | `simx` (cycle-approximate C++ simulator) | `VORTEX_DRIVER=simx` + `LD_LIBRARY_PATH=<build>/runtime` |
+| Clusters × cores × socket | `1 × 1 × 1` | `NUM_CLUSTERS`, `NUM_CORES`, `SOCKET_SIZE` (all default 1) |
+| Warps per core | **4** | `NUM_WARPS` (default) |
+| Threads per warp | **8** | `NUM_THREADS=8` — passed via `CONFIGS` at the simx rebuild |
+| SIMD width | 8 | `SIMD_WIDTH = NUM_THREADS` |
+| Issue width | 1 | `ISSUE_WIDTH = ceil(NUM_WARPS / 16)` → 1 |
+| XLEN | 32 | `--xlen=32` at `../configure` time |
+| L1 I-cache | 16 KB, 4-way, 64 B line | `ICACHE_SIZE=16384`, `ICACHE_NUM_WAYS=4` |
+| L1 D-cache | 16 KB, 4-way, 64 B line, 8 banks, 16-entry MSHR | `DCACHE_SIZE=16384`, `DCACHE_NUM_WAYS=4`, `DCACHE_NUM_BANKS` (→ 8 at NT=8), `DCACHE_MSHR_SIZE=16` |
+| L2 cache | **disabled** (direct-to-memory beyond L1D) | `L2_ENABLE` not defined |
+| L3 cache | **disabled** | `L3_ENABLE` not defined |
+| Local memory | 16 KB per core | `LMEM_ENABLE` + `LMEM_LOG_SIZE=14` (2^14 = 16384 bytes) |
+| LSU lanes / blocks | 8 / 1 | `NUM_LSU_LANES = SIMD_WIDTH = 8`, `NUM_LSU_BLOCKS=1` |
+| TCU | **enabled**, dense + 2:4 sparse | `EXT_TCU_ENABLE` + `TCU_SPARSE_ENABLE` at the simx rebuild |
+| TCU lanes | 8 | `NUM_TCU_LANES = NUM_THREADS` |
+| TCU fp16 tile (kernel-visible) | `TM = 8, TN = 8, TK = 16` elements | computed by `wmma_config_t<NUM_TCU_LANES, fp16, fp32>` |
+| TCU registers per fragment | 8 | `TCU_NR = 8` (from `VX_tcu_pkg.sv`) |
+
+To rebuild simx at exactly this configuration:
+
+```bash
+cd vortex/build
+CONFIGS="-DNUM_THREADS=8 -DEXT_TCU_ENABLE -DTCU_SPARSE_ENABLE" \
+  make -C sim/simx clean && \
+CONFIGS="-DNUM_THREADS=8 -DEXT_TCU_ENABLE -DTCU_SPARSE_ENABLE" \
+  make -C sim/simx -s
+
+CONFIGS="-DNUM_THREADS=8 -DEXT_TCU_ENABLE -DTCU_SPARSE_ENABLE" \
+  make -C runtime/simx clean && \
+CONFIGS="-DNUM_THREADS=8 -DEXT_TCU_ENABLE -DTCU_SPARSE_ENABLE" \
+  make -C runtime/simx -s
+```
+
+All 51 sweep runs in Section 5 of `sweet_spot_sweep.csv` used this
+exact configuration.
+
+**Why the hardware matters for the sweet-spot shapes**:
+
+- **L1D = 16 KB + no L2** — the two attention/flash rebounds
+  (`d=3072` peak, `d=4096` regression) are almost certainly
+  L1D-capacity effects. At `n=64, d=3072` the fp16 Q + K_col
+  buffers are `64 × 3072 × 2 bytes = 384 KB each`, ×2 for both
+  matrices, which overflows the 16 KB L1D regardless — but the
+  miss *rate* and bank conflict pattern changes as `d` grows
+  past a specific threshold. A Vortex build with an L2 cache
+  or a bigger L1D would likely push the dense/SIMT peak to a
+  higher `d` and soften the `d=4096` dip.
+- **Warps per core = 4** — SIMT performance on attention/flash is
+  bottlenecked on softmax serialization; more warps would help
+  SIMT hide that latency, which would *shrink* the dense/SIMT
+  ratio at small/medium shapes. The sweet spot at `d=3072` would
+  likely move down to `d=2048` with more warps.
+- **Threads per warp = 8** — directly sets the TCU tile size
+  (`TM = TN = 8`, `TK = 16` elements for fp16). Smaller `NT`
+  shrinks the tiles and the sweet spot shifts toward smaller `d`;
+  larger `NT` does the opposite. At `NT=16` or `NT=32` the
+  absolute dense/SIMT numbers stay in the same ballpark but the
+  sweet-spot shape changes.
+- **TCU sparse metadata overhead is fixed per mma_sync call**,
+  so the sparse/dense ratio is mostly sensitive to `K_gemm`
+  (more k-steps amortize the overhead). That's why the CNN
+  sparse sweet spot is at the largest `K_gemm` you can afford
+  (`K_gemm ≥ 288` for 3×3 conv, `K_gemm = 800` for the 5×5 C4
+  case).
+
+If you want the sweet-spot numbers to transfer to a different
+build, re-run the 11-candidate sweep above on your build and
+re-pick the best-combined-score row per group. The shapes I
+tested will still be reasonable candidates, but don't assume
+the winner is the same.
+
 #### Summary
 
 A directed sweep across 11 candidate shapes (6 attention/flash +
