@@ -5,8 +5,10 @@ PROJECT := akili_cnn
 
 NUM_THREADS ?= 8
 
-# SIMT-only: no TCU flags, no softfloat.
+# SIMT-only: no TCU flags, no softfloat. KMU-based launch.
 CONFIGS ?= -DNUM_THREADS=$(NUM_THREADS)
+
+KERNEL_LIB := vortex2
 
 SRCS    := main.cpp
 VX_SRCS := kernel.cpp

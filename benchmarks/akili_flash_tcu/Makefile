@@ -10,6 +10,8 @@ NUM_TCU_LANES ?= $(NUM_THREADS)
 CONFIGS ?= -DNUM_THREADS=$(NUM_THREADS) -DNUM_TCU_LANES=$(NUM_TCU_LANES) \
            -DEXT_TCU_ENABLE
 
+KERNEL_LIB := vortex2
+
 SRCS    := main.cpp
 VX_SRCS := kernel.cpp
 

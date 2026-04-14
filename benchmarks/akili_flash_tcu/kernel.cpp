@@ -9,13 +9,15 @@ namespace vt = vortex::tensor;
 using tcu_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
 
 // =============================================================================
-// Stage 2: SIMT softmax on fp32 S. NUM_WARPS CTAs x NUM_THREADS threads striped
-// across N rows (matches the DXA variant's launch shape).
+// Stage 2: SIMT softmax on fp32 S. One row per flat thread index.
 // =============================================================================
-static void softmax_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void softmax_body(kernel_arg_t* arg) {
   auto S = reinterpret_cast<float*>(arg->S_addr);
   auto P = reinterpret_cast<float*>(arg->P_addr);
   uint32_t N = arg->N;
+
+  uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= N) return;
 
   uint32_t hw_tid = blockIdx.x * NUM_THREADS + threadIdx.x;
   uint32_t stride = gridDim.x * NUM_THREADS;
@@ -38,9 +40,9 @@ static void softmax_body(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Stage 1: Dense TCU S = Q·Kᵀ   (M=N_attn, N=N_attn, K=d_attn)
+// Stage 1: Dense TCU S = Q·Kᵀ  — one output tile per 2D block.
 // =============================================================================
-static void qk_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void qk_tcu_body(kernel_arg_t* arg) {
   auto pA = reinterpret_cast<tcu_ctx::input_t*>(arg->Q_addr);
   auto pB = reinterpret_cast<tcu_ctx::input_t*>(arg->K_addr);
   auto pC = reinterpret_cast<tcu_ctx::output_t*>(arg->S_addr);
@@ -69,9 +71,9 @@ static void qk_body(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Stage 3: Dense TCU O = P·V   (M=N_attn, N=d_attn, K=N_attn)
+// Stage 3: Dense TCU O = P·V
 // =============================================================================
-static void pv_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void pv_tcu_body(kernel_arg_t* arg) {
   auto pA = reinterpret_cast<tcu_ctx::input_t*>(arg->P_addr);
   auto pB = reinterpret_cast<tcu_ctx::input_t*>(arg->V_addr);
   auto pC = reinterpret_cast<tcu_ctx::output_t*>(arg->O_addr);
@@ -100,13 +102,20 @@ static void pv_body(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Single entry point — host selects the active stage via arg->kernel_id.
-// =============================================================================
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
+
   switch (arg->kernel_id) {
-    case KID_QK_TCU:  qk_body(arg);      break;
+    case KID_QK_TCU:  qk_tcu_body(arg);  break;
     case KID_SOFTMAX: softmax_body(arg); break;
-    case KID_PV_TCU:  pv_body(arg);      break;
+    case KID_PV_TCU:  pv_tcu_body(arg);  break;
     default: break;
+  }
+
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
   }
 }

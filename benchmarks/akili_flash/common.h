@@ -19,9 +19,7 @@ typedef struct {
   uint64_t O_addr;
   uint64_t S_addr;
   uint64_t P_addr;
-  uint64_t kernel_cycles;
-  uint32_t grid_dim[2];
-  uint32_t block_dim[2];
+  uint64_t cycles_addr;  // uint32_t[num_blocks_max]
   uint32_t kernel_id;
   uint32_t seq_len;
   uint32_t head_dim;
@@ -29,7 +27,6 @@ typedef struct {
   uint32_t block_size_c;
   uint32_t N;            // padded N
   uint32_t d;            // padded d
-  uint32_t _pad;
 } kernel_arg_t;
 
 #endif

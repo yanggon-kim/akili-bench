@@ -1,9 +1,11 @@
-// akili_cnn — SIMT 2D convolution benchmark.
+// akili_cnn — SIMT 2D convolution benchmark (KMU launch API).
 //
 // Shape-configurable via CLI:
 //   -c C_in  -o C_out  -h H  -w W  -s K_size
 // stride=1, padding=0 (valid). Output: (C_out, H-K+1, W-K+1).
 // Prints KCYC[CONV,nt=<NT>]: <cycles> and PASSED!/FAILED!.
+//
+// Launch: vx_start_g with grid = {ceil(N_out/NT), C_out}, block = {NT, 1}.
 
 #include <iostream>
 #include <unistd.h>
@@ -66,12 +68,13 @@ vx_device_h device = nullptr;
 vx_buffer_h I_buffer = nullptr;
 vx_buffer_h W_buffer = nullptr;
 vx_buffer_h O_buffer = nullptr;
+vx_buffer_h cycles_buffer = nullptr;
 vx_buffer_h krnl_buffer = nullptr;
 vx_buffer_h args_buffer = nullptr;
 kernel_arg_t kernel_arg = {};
 
 static void show_usage() {
-  std::cout << "akili_cnn — SIMT conv2d benchmark" << std::endl;
+  std::cout << "akili_cnn — SIMT conv2d benchmark (KMU launch)" << std::endl;
   std::cout << "Usage: [-c C_in] [-o C_out] [-h H] [-w W] [-s K_size]" << std::endl;
 }
 
@@ -92,13 +95,24 @@ static void parse_args(int argc, char** argv) {
 
 void cleanup() {
   if (device) {
-    if (I_buffer)    vx_mem_free(I_buffer);
-    if (W_buffer)    vx_mem_free(W_buffer);
-    if (O_buffer)    vx_mem_free(O_buffer);
-    if (krnl_buffer) vx_mem_free(krnl_buffer);
-    if (args_buffer) vx_mem_free(args_buffer);
+    if (I_buffer)      vx_mem_free(I_buffer);
+    if (W_buffer)      vx_mem_free(W_buffer);
+    if (O_buffer)      vx_mem_free(O_buffer);
+    if (cycles_buffer) vx_mem_free(cycles_buffer);
+    if (krnl_buffer)   vx_mem_free(krnl_buffer);
+    if (args_buffer)   vx_mem_free(args_buffer);
     vx_dev_close(device);
   }
+}
+
+// Read back per-block cycles, take max, and print as KCYC[TAG,nt=N]: <max>.
+static uint64_t read_back_cycles(const char* tag, uint32_t num_blocks) {
+  std::vector<uint32_t> h_cycles(num_blocks, 0);
+  vx_copy_from_dev(h_cycles.data(), cycles_buffer, 0, num_blocks * sizeof(uint32_t));
+  uint32_t max_cyc = 0;
+  for (auto c : h_cycles) if (c > max_cyc) max_cyc = c;
+  printf("KCYC[%s,nt=%u]: %u\n", tag, (unsigned)NUM_THREADS, max_cyc);
+  return (uint64_t)max_cyc;
 }
 
 int main(int argc, char* argv[]) {
@@ -124,7 +138,7 @@ int main(int argc, char* argv[]) {
   uint32_t W_out = Wd - K + 1;
   uint32_t N_out = H_out * W_out;
 
-  std::cout << "akili_cnn — C_in=" << C_in << " C_out=" << C_out
+  std::cout << "akili_cnn (KMU) — C_in=" << C_in << " C_out=" << C_out
             << " H=" << H << " W=" << Wd << " K=" << K
             << " → H_out=" << H_out << " W_out=" << W_out << std::endl;
 
@@ -140,12 +154,21 @@ int main(int argc, char* argv[]) {
   size_t W_bytes = h_W.size() * sizeof(float);
   size_t O_bytes = (size_t)C_out * H_out * W_out * sizeof(float);
 
-  RT_CHECK(vx_mem_alloc(device, I_bytes, VX_MEM_READ_WRITE, &I_buffer));
+  // Grid/block for vx_start_g
+  uint32_t grid_dim[2]  = {(N_out + NUM_THREADS - 1) / NUM_THREADS, C_out};
+  uint32_t block_dim[2] = {NUM_THREADS, 1};
+  uint32_t num_blocks   = grid_dim[0] * grid_dim[1];
+  size_t cycles_bytes   = num_blocks * sizeof(uint32_t);
+
+  RT_CHECK(vx_mem_alloc(device, I_bytes,      VX_MEM_READ_WRITE, &I_buffer));
   RT_CHECK(vx_mem_address(I_buffer, &kernel_arg.I_addr));
-  RT_CHECK(vx_mem_alloc(device, W_bytes, VX_MEM_READ_WRITE, &W_buffer));
+  RT_CHECK(vx_mem_alloc(device, W_bytes,      VX_MEM_READ_WRITE, &W_buffer));
   RT_CHECK(vx_mem_address(W_buffer, &kernel_arg.W_addr));
-  RT_CHECK(vx_mem_alloc(device, O_bytes, VX_MEM_READ_WRITE, &O_buffer));
+  RT_CHECK(vx_mem_alloc(device, O_bytes,      VX_MEM_READ_WRITE, &O_buffer));
   RT_CHECK(vx_mem_address(O_buffer, &kernel_arg.O_addr));
+  RT_CHECK(vx_mem_alloc(device, cycles_bytes, VX_MEM_READ_WRITE, &cycles_buffer));
+  RT_CHECK(vx_mem_address(cycles_buffer, &kernel_arg.cycles_addr));
+
   RT_CHECK(vx_copy_to_dev(I_buffer, h_I.data(), 0, I_bytes));
   RT_CHECK(vx_copy_to_dev(W_buffer, h_W.data(), 0, W_bytes));
 
@@ -159,17 +182,11 @@ int main(int argc, char* argv[]) {
   kernel_arg.K_sz  = K;
   kernel_arg.H_out = H_out;
   kernel_arg.W_out = W_out;
-  kernel_arg.grid_dim[0] = N_out;
-  kernel_arg.grid_dim[1] = C_out;
-  kernel_arg.block_dim[0] = NUM_THREADS;
-  kernel_arg.block_dim[1] = 1;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  {
-    uint32_t grid_dim[2]  = {N_out, C_out};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
-    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
-    RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  }
+
+  RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, 0));
+  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+  read_back_cycles("CONV", num_blocks);
 
   std::vector<float> h_O((size_t)C_out * H_out * W_out);
   RT_CHECK(vx_copy_from_dev(h_O.data(), O_buffer, 0, O_bytes));

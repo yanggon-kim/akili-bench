@@ -9,13 +9,15 @@ namespace vt = vortex::tensor;
 using sp_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
 
 // =============================================================================
-// Stage 2: SIMT softmax on fp32 S. NUM_WARPS CTAs x NUM_THREADS threads striped
-// across N rows (matches the DXA variant's launch shape).
+// Stage 2: SIMT softmax on fp32 S.
 // =============================================================================
-static void softmax_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void softmax_body(kernel_arg_t* arg) {
   auto S = reinterpret_cast<float*>(arg->S_addr);
   auto P = reinterpret_cast<float*>(arg->P_addr);
   uint32_t N = arg->N;
+
+  uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= N) return;
 
   uint32_t hw_tid = blockIdx.x * NUM_THREADS + threadIdx.x;
   uint32_t stride = gridDim.x * NUM_THREADS;
@@ -38,8 +40,7 @@ static void softmax_body(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Shared sparse mma inner loop.  Parameterized on K_walk so QK (K=d_attn)
-// and PV (K=N_attn) can share one implementation.
+// Shared sparse MMA inner loop.
 // =============================================================================
 static inline void sparse_mma_loop(sp_ctx::input_t* pA_base,
                                    sp_ctx::input_t* pB_base,
@@ -84,10 +85,7 @@ static inline void sparse_mma_loop(sp_ctx::input_t* pA_base,
   sp_ctx::store_matrix_sync(pTileC, fragC, c_stride);
 }
 
-// =============================================================================
-// Stage 1: sparse TCU S = Q·Kᵀ
-// =============================================================================
-static void qk_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void qk_sparse_body(kernel_arg_t* arg) {
   auto pA = reinterpret_cast<sp_ctx::input_t*>(arg->Q_addr);
   auto pB = reinterpret_cast<sp_ctx::input_t*>(arg->K_addr);
   auto pC = reinterpret_cast<sp_ctx::output_t*>(arg->S_addr);
@@ -95,10 +93,7 @@ static void qk_body(kernel_arg_t* __UNIFORM__ arg) {
   sparse_mma_loop(pA, pB, pC, pMetaBase, arg->d, arg->N);
 }
 
-// =============================================================================
-// Stage 3: sparse TCU O = P·V
-// =============================================================================
-static void pv_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void pv_sparse_body(kernel_arg_t* arg) {
   auto pA = reinterpret_cast<sp_ctx::input_t*>(arg->P_addr);
   auto pB = reinterpret_cast<sp_ctx::input_t*>(arg->V_addr);
   auto pC = reinterpret_cast<sp_ctx::output_t*>(arg->O_addr);
@@ -107,13 +102,20 @@ static void pv_body(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Single entry point — host selects the active stage via arg->kernel_id.
-// =============================================================================
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
+
   switch (arg->kernel_id) {
-    case KID_QK_SPARSE: qk_body(arg);      break;
-    case KID_SOFTMAX:   softmax_body(arg); break;
-    case KID_PV_SPARSE: pv_body(arg);      break;
+    case KID_QK_SPARSE: qk_sparse_body(arg); break;
+    case KID_SOFTMAX:   softmax_body(arg);   break;
+    case KID_PV_SPARSE: pv_sparse_body(arg); break;
     default: break;
+  }
+
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
   }
 }

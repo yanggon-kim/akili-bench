@@ -121,6 +121,7 @@ vx_device_h device = nullptr;
 vx_buffer_h W_fp16_buffer = nullptr;
 vx_buffer_h Icol_buffer   = nullptr;
 vx_buffer_h O_buffer      = nullptr;
+vx_buffer_h cycles_buffer = nullptr;
 vx_buffer_h krnl_buffer = nullptr;
 vx_buffer_h args_buffer = nullptr;
 kernel_arg_t kernel_arg = {};
@@ -150,10 +151,20 @@ void cleanup() {
     if (W_fp16_buffer) vx_mem_free(W_fp16_buffer);
     if (Icol_buffer)   vx_mem_free(Icol_buffer);
     if (O_buffer)      vx_mem_free(O_buffer);
+    if (cycles_buffer) vx_mem_free(cycles_buffer);
     if (krnl_buffer)   vx_mem_free(krnl_buffer);
     if (args_buffer)   vx_mem_free(args_buffer);
     vx_dev_close(device);
   }
+}
+
+static uint64_t read_back_cycles(const char* tag, uint32_t num_blocks) {
+  std::vector<uint32_t> h_cycles(num_blocks, 0);
+  vx_copy_from_dev(h_cycles.data(), cycles_buffer, 0, num_blocks * sizeof(uint32_t));
+  uint32_t max_cyc = 0;
+  for (auto c : h_cycles) if (c > max_cyc) max_cyc = c;
+  printf("KCYC[%s,nt=%u]: %u\n", tag, (unsigned)NUM_THREADS, max_cyc);
+  return (uint64_t)max_cyc;
 }
 
 int main(int argc, char* argv[]) {
@@ -214,6 +225,10 @@ int main(int argc, char* argv[]) {
   std::vector<uint16_t> h_Icol_fp16((size_t)N_gemm * K_gemm);
   for (size_t i = 0; i < h_Icol_fp16.size(); ++i) h_Icol_fp16[i] = f2h_host(h_Icol_fp32[i]);
 
+  uint32_t grid_dim[2]  = {N_gemm / TN, M_gemm / TM};
+  uint32_t block_dim[2] = {NUM_THREADS, 1};
+  uint32_t num_blocks   = grid_dim[0] * grid_dim[1];
+
   RT_CHECK(vx_mem_alloc(device, h_W_fp16.size() * sizeof(uint16_t),
                         VX_MEM_READ_WRITE, &W_fp16_buffer));
   RT_CHECK(vx_mem_address(W_fp16_buffer, &kernel_arg.W_addr));
@@ -222,6 +237,9 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_mem_address(Icol_buffer, &kernel_arg.B_addr));
   RT_CHECK(vx_mem_alloc(device, O_bytes, VX_MEM_READ_WRITE, &O_buffer));
   RT_CHECK(vx_mem_address(O_buffer, &kernel_arg.O_addr));
+  RT_CHECK(vx_mem_alloc(device, num_blocks * sizeof(uint32_t),
+                        VX_MEM_READ_WRITE, &cycles_buffer));
+  RT_CHECK(vx_mem_address(cycles_buffer, &kernel_arg.cycles_addr));
   RT_CHECK(vx_copy_to_dev(W_fp16_buffer, h_W_fp16.data(), 0,
                           h_W_fp16.size() * sizeof(uint16_t)));
   RT_CHECK(vx_copy_to_dev(Icol_buffer, h_Icol_fp16.data(), 0,
@@ -240,16 +258,10 @@ int main(int argc, char* argv[]) {
   kernel_arg.M_gemm = M_gemm;
   kernel_arg.N_gemm = N_gemm;
   kernel_arg.K_gemm = K_gemm;
-  kernel_arg.grid_dim[0]  = N_gemm / TN;
-  kernel_arg.grid_dim[1]  = M_gemm / TM;
-  kernel_arg.block_dim[0] = NUM_THREADS;
-  kernel_arg.block_dim[1] = 1;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-
-  uint32_t grid_dim[2]  = {N_gemm / TN, M_gemm / TM};
-  uint32_t block_dim[2] = {NUM_THREADS, 1};
-  RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
+  RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, 0));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+  read_back_cycles("CONV", num_blocks);
 
   // Extract the valid (oc, oy, ox) region from the padded [M_gemm × N_gemm] output.
   std::vector<float> h_O_gemm((size_t)M_gemm * N_gemm, 0.0f);

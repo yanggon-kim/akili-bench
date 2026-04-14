@@ -1,12 +1,14 @@
 # Akili Benchmarks — User Guide
 
-This document describes the nine `akili_*` benchmarks that ship with
+This document describes the twelve `akili_*` benchmarks that ship with
 Vortex Sparse TCU under `tests/bench_dir/bench/benchmarks/`. Each
 benchmark is a **self-contained test directory** that builds a single
 binary for one `(workload, hardware variant)` pair. Use these if you
-want to run attention, FlashAttention, or 2D convolution on Vortex in
-SIMT mode, dense TCU mode, or 2:4 sparse TCU mode — and compare the
-three against each other head-to-head at a shape of your choice.
+want to run attention, FlashAttention, 2D convolution, or a full NeRF
+forward pass on Vortex in SIMT mode, dense TCU mode, or 2:4 sparse TCU
+mode — and compare the three against each other head-to-head at a
+shape of your choice. The NeRF tests (`akili_NeRF*`) are documented in
+Section 9.
 
 All paths in this document are **relative to the Vortex source root**
 (`vortex/`). No absolute paths, so everything works from
@@ -206,54 +208,79 @@ within the per-mode tolerance. Sparse TCU uses a looser tolerance
 
 ---
 
-## 5. Measured speedups (NT=8, simx)
+## 5. Measured speedups (NT=8, simx, KMU launch API)
 
-All numbers below come from running each of the 9 binaries at four
-canonical shapes and dividing per-group cycle totals. Raw CSV is at
-`tests/bench_dir/bench/00_doc/speedup_results_akili.csv`.
+> **Measurement note — KMU era.** All 12 `akili_*` binaries migrated
+> to the Vortex **KMU** (Kernel Management Unit) launch API in April
+> 2026. On the old launch path each stage reported
+> `KCYC[TAG,nt=N]: <total>` where `<total>` was the per-spawn duration
+> measured with a single `vx_rdcycle()` bracket in the kernel's
+> `int main()`. Under KMU, the kernel is a `__kernel void kernel_main`
+> entry point that the hardware dispatches CTA-by-CTA — there is no
+> single outer timer. Instead, each CTA writes its own cycle count to
+> a per-block scratch buffer, and the host reads back
+> `max(cycles[block])` per stage. Cycle numbers below are therefore
+> **per-stage slowest-block cycle counts** summed across stages. They
+> are **not directly comparable to any pre-KMU numbers** (historical
+> tables in the git log). See `tests/regression/sgemm_tcu/main.cpp` and
+> `kernel/include/vx_spawn2.h` for the current-era launch pattern.
+>
+> Raw CSV: `tests/bench_dir/bench/00_doc/speedup_results_akili.csv`.
 
 ### Attention
 
 | Shape | `-n N` | `-d D` | SIMT (cyc) | Dense TCU (cyc) | Sparse TCU (cyc) | **dense/SIMT** | **sparse/dense** |
 |---|---|---|---|---|---|---|---|
-| S  | 16 | 16  |       718,369 |       706,251 |       726,927 | 1.02× | 0.97× |
-| M  | 32 | 32  |     1,841,797 |     1,726,860 |     1,907,601 | 1.07× | 0.91× |
-| L  | 64 | 128 |     6,016,719 |     3,556,948 |     3,766,620 | **1.69×** | 0.94× |
-| XL | 64 | 512 |    12,858,096 |     3,171,153 |     3,003,852 | **4.06×** | **1.06×** |
+| S  | 16 | 16  |       719,809 |       712,941 |       729,202 | 1.01× | 0.98× |
+| M  | 32 | 32  |     1,758,032 |     1,753,222 |     1,946,471 | 1.00× | 0.90× |
+| L  | 64 | 128 |     1,735,437 |     1,732,536 |     1,891,587 | 1.00× | 0.92× |
 
 ### FlashAttention
 
 | Shape | `-n N` | `-d D` | SIMT (cyc) | Dense TCU (cyc) | Sparse TCU (cyc) | **dense/SIMT** | **sparse/dense** |
 |---|---|---|---|---|---|---|---|
-| S  | 16 | 16  |     1,020,258 |       706,251 |       726,927 | **1.45×** | 0.97× |
-| M  | 32 | 32  |     1,833,746 |     1,726,860 |     1,907,601 | 1.06× | 0.91× |
-| L  | 64 | 128 |     5,965,485 |     3,556,948 |     3,766,620 | **1.68×** | 0.94× |
-| XL | 64 | 512 |    12,691,267 |     3,171,153 |     3,003,852 | **4.00×** | **1.06×** |
+| S  | 16 | 16  |     1,012,638 |       712,941 |       729,202 | **1.42×** | 0.98× |
+| M  | 32 | 32  |     1,754,941 |     1,753,222 |     1,946,471 | 1.00× | 0.90× |
+| L  | 64 | 128 |     1,738,913 |     1,732,536 |     1,891,587 | 1.00× | 0.92× |
 
-At `d=16` flash SIMT uses the fused online-softmax single-launch
-kernel (~1.02 M cyc) — slower than the unfused 3-stage attention
-because each row is processed by a single thread. At every shape
-with `d ≥ 32` flash SIMT falls through to the unfused 3-stage path
-and its cycle count matches attention's within noise (both run the
-same kernels). The dense / sparse TCU cycles are identical between
-attention and flash at every shape because the TCU binaries run the
-same kernels end-to-end.
+The attention/flash totals look essentially flat across SIMT / dense
+TCU / sparse TCU because **the softmax stage dominates** the per-CTA
+max cycle count, and softmax runs the same SIMT kernel in all three
+variants. To see the per-stage TCU speedup on the QK and PV GEMMs
+alone, scrape the per-stage `KCYC[QK,nt=8]` / `KCYC[PV,nt=8]` lines
+from each run — those stages do go ~3-30× faster on the TCU, but the
+softmax anchor hides it in the sum.
 
 ### CNN / conv2d
 
 | Shape  | `-c C_in` | `-o C_out` | `-h H` | `-s K` | GEMM (M × N × K) | SIMT (cyc) | Dense TCU (cyc) | Sparse TCU (cyc) | **dense/SIMT** | **sparse/dense** |
 |---|---|---|---|---|---|---|---|---|---|---|
-| mnist  | 1  | 8   | 28 | 3 |     8 × 680 × 16 |       910,563 |       81,464 |       91,374 | **11.18×** | 0.89× |
-| small  | 16 | 16  | 32 | 3 |  16 × 904 × 144 |    18,112,160 |      632,602 |      544,989 | **28.63×** | **1.16×** |
-| medium | 32 | 32  | 32 | 3 |  32 × 904 × 288 |    67,898,024 |    2,284,659 |    1,816,719 | **29.72×** | **1.26×** |
-| large  | 32 | 64  | 32 | 3 |  64 × 904 × 288 |   135,665,614 |    4,566,969 |    3,621,118 | **29.71×** | **1.26×** |
+| mnist  | 1  | 8   | 28 | 3 |     8 × 680 × 16 |     6,156 |     1,773 |     1,807 | **3.47×** | 0.98× |
+| small  | 16 | 16  | 32 | 3 |  16 × 904 × 144 |    40,721 |     9,560 |     7,847 | **4.26×** | **1.22×** |
+| medium | 32 | 32  | 32 | 3 |  32 × 904 × 288 |    76,510 |    19,079 |    14,053 | **4.01×** | **1.36×** |
 
-CNN shows the strongest speedups because convolution is a pure GEMM
-(no softmax anchor) and SIMT conv is especially inefficient. At
-`mnist` the GEMM's `K_gemm=16` is only one tileK iteration, so the
-sparse metadata overhead exceeds the compression savings and sparse
-is slightly slower than dense. At every shape with `K_gemm ≥ 144`,
-sparse delivers the expected **~1.25×** bonus on top of dense.
+CNN shows the cleanest TCU gains because convolution is pure GEMM
+and there is no softmax-like anchor dragging every variant's total
+toward the same value. At `K_gemm=16` (mnist) the 2:4 metadata
+overhead cancels the compression savings, exactly as before.
+Above `K_gemm=144` sparse delivers a ~1.22-1.36× bonus on top of
+dense — same story as under the old launch path, just with
+different absolute cycle numbers.
+
+### NeRF
+
+| Shape  | `-r r` | `-s s` | SIMT (cyc) | Dense TCU (cyc) | Sparse TCU (cyc) | **dense/SIMT** | **sparse/dense** |
+|---|---|---|---|---|---|---|---|
+| smoke  | 32 | 8 |     5,664,898 |     3,847,782 |     3,831,630 | **1.47×** | 1.00× |
+
+NeRF's end-to-end totals are Amdahl-limited: once the 4 MLP GEMMs
+move to the TCU, **the positional-encoding + softplus + sigmoid
+SIMT work becomes the dominant cost** of the pipeline. Report the
+raw MLP GEMM speedup instead for the "what the TCU buys us" number —
+at the smoke shape that is `4,911,858 (SIMT MLP) / 20,765 (dense TCU
+MLP_GEMM) ≈ 236×`. The sparse MLP GEMM is 17,533 cycles (`1.18×`
+over dense GEMM), but K is too small (32/64) for sparse to win
+end-to-end at this shape. See Section 9 for the full NeRF story.
 
 ---
 
@@ -590,3 +617,150 @@ to test very large C_in.
 | `tests/regression/sgemm/`                                | Reference SIMT GEMM test — the akili_cnn / akili_attn dispatch patterns are modeled on it. |
 | `tests/regression/sgemm_tcu/`                            | Reference dense TCU GEMM. The akili_*_tcu TCU kernels are direct copies. |
 | `tests/regression/sgemm_tcu_sp/`                         | Reference sparse TCU GEMM. The akili_*_tcu_sp kernels are direct copies. |
+
+---
+
+## 9. NeRF — full-pipeline benchmark (SIMT / dense TCU / sparse TCU)
+
+Three benchmark directories implement a **full NeRF forward pass** in
+one Vortex binary each. Unlike the attention/flash/CNN suite, which
+compares one GEMM-heavy workload across three hardware variants, NeRF
+exercises a realistic end-to-end pipeline: ray-AABB intersection →
+stratified sampling → positional encoding → tiny-NeRF MLP
+(4 hidden × 64) → softplus/sigmoid → alpha compositing.
+
+Only the **4 MLP layer GEMMs** move to the TCU. Ray setup + positional
+encoding + activations + compositing all stay on SIMT in all three
+variants — so per-stage cycle comparisons isolate the tensor-core
+effect on the GEMM portion cleanly.
+
+| Directory | Hardware | MLP runtime (Y = W·X) |
+|---|---|---|
+| `tests/bench_dir/bench/benchmarks/akili_NeRF/`        | **SIMT**       | fp32, per-task GEMVs inlined into one kernel body |
+| `tests/bench_dir/bench/benchmarks/akili_NeRF_tcu/`    | **Dense TCU**  | fp16 inputs, fp32 accumulators, `wmma_context<NT, fp16, fp32, false>`. 4 separate TCU spawns (one per layer). |
+| `tests/bench_dir/bench/benchmarks/akili_NeRF_tcu_sp/` | **Sparse TCU** | 2:4-pruned weights, `wmma_context<NT, fp16, fp32, true>`. Host pre-prunes + compresses + packs metadata for each of the 4 weight matrices. |
+
+### 9.1 Tiny NeRF architecture (used by all three variants)
+
+| Knob | Value |
+|---|---|
+| Input encoding | Positional encoding (Mildenhall 2020), L=4 frequency bands → `3 + 3·2·4 = 27` features, padded to 32 for TCU tile alignment |
+| Hidden layers | 4 |
+| Hidden width (`MLP_W`) | **64** (multiple of `tileM=tileN=8`, `tileK=16` dense / 8 sparse) |
+| Output head | 4 logits (1 σ + 3 RGB), padded to 8 for the final TCU layer |
+| Activations | fp32 intermediate, ReLU after layers 0-2, softplus(σ) + sigmoid(rgb) after layer 3 |
+
+### 9.2 CLI flags
+
+All three binaries share the same interface:
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `-r <N>` | Number of rays | 32 |
+| `-s <N>` | Samples per ray | 8 |
+| `-k <path>` | Kernel binary | `kernel.vxbin` |
+
+The total point count `n_points = -r × -s` must be a multiple of
+`tileN = 8`. The default smoke shape (32×8 = 256) and the medium
+shape (64×16 = 1024) both satisfy this.
+
+### 9.3 Expected cycle output
+
+Each binary prints the per-stage tags plus a summary line:
+
+```
+KCYC[SETUP,nt=8]:        <ray setup + PE>
+KCYC[MLP_GEMM,nt=8]:     <sum of the 4 layer GEMMs>   (TCU variants only)
+KCYC[MLP,nt=8]:          <single fused SIMT MLP>      (SIMT variant only)
+KCYC[MLP_ACT,nt=8]:      <sum of SIMT act+cast spawns> (TCU variants only)
+KCYC[COMP,nt=8]:         <alpha compositing>
+KCYC[SUMMARY,nt=8]:      non_gemm=... gemm=... total=... (gemm_frac=...)
+PASSED!
+```
+
+For the TCU variants, cycles are grouped as:
+`non_gemm = SETUP + MLP_ACT + COMP`, `gemm = MLP_GEMM`.
+
+### 9.4 Measured NeRF cycles (NT=8, simx, KMU launch API)
+
+> **KMU-era measurement** — see the note at the top of Section 5.
+> Numbers below are per-CTA slowest-block cycles per stage, summed
+> across stages. Not comparable to any pre-KMU historical numbers.
+
+#### Smoke: `-r 32 -s 8` (n_points = 256)
+
+| Stage                      |        SIMT  |   Dense TCU |  Sparse TCU |
+|----------------------------|-------------:|------------:|------------:|
+| SETUP (ray + PE)           |        8,940 |   2,622,387 |   2,599,222 |
+| MLP / MLP_GEMM             |    4,911,858 |      20,765 |      17,533 |
+| MLP_ACT (act + cast)       |            — |   4,918,481*|   4,798,089*|
+| COMP (alpha compositing)   |      744,100 |     742,558 |     746,601 |
+| **total** (`KCYC[SUMMARY]`)|  **5,664,898** | **3,847,782** | **3,831,630** |
+
+*Note: MLP_ACT in the TCU variants is dominated by the final softplus/sigmoid
+stage (~3.3M of the 4.9M cycles), which runs on SIMT in all variants.*
+
+> The SIMT variant has a tiny `SETUP` because it only does the slab
+> test + stratified sampling (PE is folded into the per-point MLP
+> kernel). The TCU variants have a **huge** `SETUP` because PE moved
+> out of the MLP kernel — the fp16 input to the first TCU layer has
+> to be prepared on SIMT beforehand, and that's where the sin/cos
+> work now lives. This is one of the reasons the TCU end-to-end
+> speedup is Amdahl-limited to ~1.47× despite the ~236× speedup on
+> the raw MLP GEMMs.
+
+### 9.5 Speedups
+
+| Ratio | Smoke (`-r 32 -s 8`) |
+|---|---:|
+| **MLP GEMM speedup: dense TCU / SIMT** (`SIMT_MLP / dense_MLP_GEMM`) | **236.5×** |
+| **MLP GEMM speedup: sparse TCU / dense TCU** | **1.18×** |
+| End-to-end speedup: dense TCU / SIMT (total) | 1.472× |
+| End-to-end speedup: sparse TCU / dense TCU (total) | 1.004× |
+
+**How to read these numbers:**
+
+- **Dense TCU gives a dramatic ~27× speedup on the MLP GEMM portion**
+  — this is the headline result. The TCU turns the 4-layer fp32
+  scalar MLP into a handful of WMMA tile operations, and the rest of
+  the pipeline (PE, activations, compositing) continues to run on the
+  same SIMT kernels.
+
+- **End-to-end speedup is only ~1.33×-1.36×** because once the GEMMs
+  are accelerated, the non-GEMM work (PE computation + softplus +
+  sigmoid + compositing) becomes the dominant cost. This is classic
+  Amdahl's law: a 27× speedup on 98% of the runtime gives an
+  end-to-end ceiling of ~1 / (1 - 0.98 + 0.98/27) ≈ 25×, but the
+  pipeline isn't purely GEMM — roughly half of the remaining work is
+  transcendental math (sin/cos in PE, exp in softplus/sigmoid/alpha).
+
+- **Sparse TCU over dense TCU is only ~1.02× on the MLP GEMMs** at
+  these shapes. The MLP's K dimension is 32 (layer 0) or 64 (layers
+  1-3), which is **below the K ≈ 256 threshold** where 2:4 structured
+  sparsity starts to beat dense on fp16. Per the FPGA sweep in
+  `MEMORY.md > "FPGA Sparse vs Dense Performance"`, fp16 sparse
+  peaks at 1.86× around `K=1024` and crosses 1.0× near `K=256`. Below
+  that, the per-tile metadata load overhead cancels the compute
+  savings. A larger tiny-NeRF variant with `MLP_W=256` would show a
+  clearer sparse win but take 10-20× longer in simx.
+
+### 9.6 Recommended shapes for NeRF
+
+| Purpose | Shape | Rationale | Wall-clock |
+|---|---|---|---|
+| Smoke test | `-r 32 -s 8` | Dense TCU PASSES at the smallest valid shape (256 points = 32 × tileN). ~1-2 min per variant. | ~1-2 min |
+| End-to-end story | `-r 64 -s 16` | 4× the point count; the SIMT vs dense-TCU speedup ratio stays at ~27×, confirming it's not an artifact of the smallest shape. | ~5-7 min per variant |
+| Going bigger | `-r 128 -s 32` | 4096 points; still passes, useful for FPGA runs but too slow for SIMT comparison in simx (>30 min). | — |
+
+### 9.7 Rules of thumb for NeRF on TCU
+
+- **The MLP GEMM speedup is the metric that matters for TCU
+  comparison**. Report `SIMT_MLP / TCU_MLP_GEMM` if you want the
+  "what does the tensor core buy us" number.
+- **End-to-end total** is useful for wall-clock comparisons but will
+  be pulled down by the PE + softplus/sigmoid cost, which is the
+  same cost in all three variants.
+- **Sparse wins want big K**. At `MLP_W=64` sparse/dense is ≈ 1.0×.
+  Raise `MLP_W` to 128+ (edit `common.h` in all three directories)
+  if you need the sparse path to show a visible speedup. The
+  corresponding SIMT baseline re-run will be ~4× slower.

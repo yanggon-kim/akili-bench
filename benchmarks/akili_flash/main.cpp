@@ -114,6 +114,7 @@ vx_buffer_h V_buffer = nullptr;
 vx_buffer_h S_buffer = nullptr;
 vx_buffer_h P_buffer = nullptr;
 vx_buffer_h O_buffer = nullptr;
+vx_buffer_h cycles_buffer = nullptr;
 vx_buffer_h krnl_buffer = nullptr;
 vx_buffer_h args_buffer = nullptr;
 kernel_arg_t kernel_arg = {};
@@ -144,10 +145,19 @@ void cleanup() {
     if (S_buffer)    vx_mem_free(S_buffer);
     if (P_buffer)    vx_mem_free(P_buffer);
     if (O_buffer)    vx_mem_free(O_buffer);
+    if (cycles_buffer) vx_mem_free(cycles_buffer);
     if (krnl_buffer) vx_mem_free(krnl_buffer);
     if (args_buffer) vx_mem_free(args_buffer);
     vx_dev_close(device);
   }
+}
+
+static void read_back_cycles(const char* stage_tag, uint32_t num_blocks) {
+  std::vector<uint32_t> h_cycles(num_blocks, 0);
+  vx_copy_from_dev(h_cycles.data(), cycles_buffer, 0, num_blocks * sizeof(uint32_t));
+  uint32_t max_cyc = 0;
+  for (auto c : h_cycles) if (c > max_cyc) max_cyc = c;
+  printf("KCYC[%s,nt=%u]: %u\n", stage_tag, (unsigned)NUM_THREADS, max_cyc);
 }
 
 int main(int argc, char* argv[]) {
@@ -209,19 +219,21 @@ int main(int argc, char* argv[]) {
     kernel_arg.block_size_r = block_size_r;
     kernel_arg.block_size_c = block_size_c;
     kernel_arg.kernel_id    = KID_FLASH_FUSED;
-    kernel_arg.grid_dim[0]  = N / block_size_r;
-    kernel_arg.grid_dim[1]  = 1;
-    kernel_arg.block_dim[0] = block_size_r;
-    kernel_arg.block_dim[1] = 1;
+
+    uint32_t grid_dim[2]  = {N / block_size_r, 1};
+    uint32_t block_dim[2] = {block_size_r, 1};
+    uint32_t num_blocks   = grid_dim[0];
+    uint32_t lmem_size    = (block_size_r + 2 * block_size_c) * d * sizeof(float);
+
+    RT_CHECK(vx_mem_alloc(device, num_blocks * sizeof(uint32_t),
+                          VX_MEM_READ_WRITE, &cycles_buffer));
+    RT_CHECK(vx_mem_address(cycles_buffer, &kernel_arg.cycles_addr));
 
     std::cout << "=== Fused SIMT flash (d=" << d << ") ===" << std::endl;
     RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-    {
-      uint32_t grid_dim[2]  = {N / block_size_r, 1};
-      uint32_t block_dim[2] = {block_size_r, 1};
-      RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
-      RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-    }
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, lmem_size));
+    RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+    read_back_cycles("FUSED", num_blocks);
 
     std::vector<float> h_O(N * d);
     RT_CHECK(vx_copy_from_dev(h_O.data(), O_buffer, 0, nd_bytes));
@@ -270,20 +282,34 @@ int main(int argc, char* argv[]) {
 
   int errors = 0;
 
+  // Allocate cycles buffer sized to the largest stage grid.
+  uint32_t gd_qk_x = (N + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t gd_qk_y = N;
+  uint32_t gd_sm_x = (N + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t gd_pv_x = (d + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t gd_pv_y = N;
+  uint32_t qk_blocks = gd_qk_x * gd_qk_y;
+  uint32_t sm_blocks = gd_sm_x;
+  uint32_t pv_blocks = gd_pv_x * gd_pv_y;
+  uint32_t max_blocks = qk_blocks;
+  if (sm_blocks > max_blocks) max_blocks = sm_blocks;
+  if (pv_blocks > max_blocks) max_blocks = pv_blocks;
+  RT_CHECK(vx_mem_alloc(device, max_blocks * sizeof(uint32_t),
+                        VX_MEM_READ_WRITE, &cycles_buffer));
+  RT_CHECK(vx_mem_address(cycles_buffer, &kernel_arg.cycles_addr));
+
+  uint32_t block_dim[2] = {NUM_THREADS, 1};
+
   // Stage 1
   std::cout << "=== Stage 1: S = Q @ K^T ===" << std::endl;
-  kernel_arg.grid_dim[0] = N;
-  kernel_arg.grid_dim[1] = N;
-  kernel_arg.block_dim[0] = NUM_THREADS;
-  kernel_arg.block_dim[1] = 1;
   kernel_arg.kernel_id = KID_QK_SIMT;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
   {
-    uint32_t grid_dim[2]  = {N, N};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
-    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
-    RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+    uint32_t grid_dim[2] = {gd_qk_x, gd_qk_y};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, 0));
   }
+  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+  read_back_cycles("QK", qk_blocks);
   std::vector<float> h_S(N*N);
   RT_CHECK(vx_copy_from_dev(h_S.data(), S_buffer, 0, s_bytes));
   {
@@ -296,18 +322,14 @@ int main(int argc, char* argv[]) {
 
   // Stage 2
   std::cout << "=== Stage 2: P = softmax(S) ===" << std::endl;
-  kernel_arg.grid_dim[0] = 8;
-  kernel_arg.grid_dim[1] = 1;
-  kernel_arg.block_dim[0] = NUM_THREADS;
-  kernel_arg.block_dim[1] = 1;
   kernel_arg.kernel_id = KID_SOFTMAX;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
   {
-    uint32_t grid_dim[2]  = {8, 1};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
-    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
-    RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+    uint32_t grid_dim[2] = {gd_sm_x, 1};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
   }
+  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+  read_back_cycles("SM", sm_blocks);
   std::vector<float> h_P(N*N);
   RT_CHECK(vx_copy_from_dev(h_P.data(), P_buffer, 0, s_bytes));
   {
@@ -320,18 +342,14 @@ int main(int argc, char* argv[]) {
 
   // Stage 3
   std::cout << "=== Stage 3: O = P @ V ===" << std::endl;
-  kernel_arg.grid_dim[0] = d;
-  kernel_arg.grid_dim[1] = N;
-  kernel_arg.block_dim[0] = NUM_THREADS;
-  kernel_arg.block_dim[1] = 1;
   kernel_arg.kernel_id = KID_PV_SIMT;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
   {
-    uint32_t grid_dim[2]  = {d, N};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
-    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
-    RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+    uint32_t grid_dim[2] = {gd_pv_x, gd_pv_y};
+    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, 0));
   }
+  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+  read_back_cycles("PV", pv_blocks);
   std::vector<float> h_O(N*d);
   RT_CHECK(vx_copy_from_dev(h_O.data(), O_buffer, 0, out_bytes));
   {

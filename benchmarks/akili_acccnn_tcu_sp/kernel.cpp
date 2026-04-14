@@ -7,11 +7,12 @@ namespace vt = vortex::tensor;
 using sp_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
 
 // =============================================================================
-// akili_acccnn_tcu_sp — Sparse TCU conv2d via im2col + sgemm_tcu_sp-style GEMM.
-// Host prunes W 2:4 along K_gemm, compresses, packs metadata. One output tile
-// per block; KMU-dispatched per-CTA via vx_start_g.
+// akili_acccnn_tcu_sp — Sparse (2:4) TCU conv2d via im2col + sgemm_tcu_sp-style
+// GEMM.  Host prunes W 2:4 along K_gemm, compresses, packs metadata.
 // =============================================================================
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
+
   auto pA = reinterpret_cast<sp_ctx::input_t*>(arg->W_addr);
   auto pB = reinterpret_cast<sp_ctx::input_t*>(arg->B_addr);
   auto pC = reinterpret_cast<sp_ctx::output_t*>(arg->O_addr);
@@ -22,6 +23,7 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   uint32_t K = arg->K_gemm;
   (void)M;
   uint32_t stride_A = K / 2;
+  (void)M;
 
   sp_ctx::fragment_a   fragA;
   sp_ctx::fragment_b   fragB;
@@ -57,4 +59,11 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 
   auto pTileC = pC + tile_row * N + tile_col;
   sp_ctx::store_matrix_sync(pTileC, fragC, N);
+
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
+  }
 }

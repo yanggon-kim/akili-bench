@@ -8,9 +8,11 @@ using tcu_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
 
 // =============================================================================
 // akili_acccnn_tcu — Dense TCU conv2d via GEMM over (W_gemm × Icol).
-// One output tile per block. KMU-dispatched per-CTA via vx_start_g.
+// Mirrors tests/regression/sgemm_tcu/kernel.cpp. One output tile per block.
 // =============================================================================
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
+
   auto pA = reinterpret_cast<tcu_ctx::input_t*>(arg->W_addr);
   auto pB = reinterpret_cast<tcu_ctx::input_t*>(arg->B_addr);
   auto pC = reinterpret_cast<tcu_ctx::output_t*>(arg->O_addr);
@@ -38,4 +40,11 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 
   auto pTileC = pC + tile_row * N + tile_col;
   tcu_ctx::store_matrix_sync(pTileC, fragC, N);
+
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
+  }
 }

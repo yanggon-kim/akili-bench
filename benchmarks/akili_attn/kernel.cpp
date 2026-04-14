@@ -5,22 +5,22 @@
 #include <algorithm>
 
 // =============================================================================
-// SIMT attention kernels (KMU-dispatched).
-//   qk_body       : S[i,j] = sum_k Q[i,k] * K[k,j]      — one block per (i,j)
-//   softmax_body  : P = softmax(S) row-wise             — striped hw-thread pattern
-//   pv_body       : O[i,j] = sum_k P[i,k] * V[k,j]      — one block per (i,j)
+// akili_attn — SIMT attention (KMU launch API).
+//   kernel0_body  : S[i,j] = sum_k Q[i,k] * K[k,j]      — 2D grid (col, row)
+//   kernel1_body  : P = softmax(S) row-wise             — 1D grid (row)
+//   kernel2_body  : O[i,j] = sum_k P[i,k] * V[k,j]      — 2D grid (col, row)
 // =============================================================================
 
-static void qk_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void kernel0_body(kernel_arg_t* arg) {
   auto Q = reinterpret_cast<TYPE*>(arg->Q_addr);
   auto K = reinterpret_cast<TYPE*>(arg->K_addr);
   auto S = reinterpret_cast<TYPE*>(arg->S_addr);
   auto N = arg->N;
   auto d = arg->d;
 
-  int col = blockIdx.x;
-  int row = blockIdx.y;
-  if (row >= (int)N || col >= (int)N) return;
+  uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= N || col >= N) return;
 
   TYPE sum(0);
   for (uint32_t e = 0; e < d; ++e) {
@@ -29,13 +29,13 @@ static void qk_body(kernel_arg_t* __UNIFORM__ arg) {
   S[row * N + col] = sum;
 }
 
-static void softmax_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void kernel1_body(kernel_arg_t* arg) {
   auto S = reinterpret_cast<TYPE*>(arg->S_addr);
   auto P = reinterpret_cast<TYPE*>(arg->P_addr);
   uint32_t N = arg->N;
 
-  uint32_t hw_tid = blockIdx.x * NUM_THREADS + threadIdx.x;
-  uint32_t stride = gridDim.x * NUM_THREADS;
+  uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= N) return;
 
   for (uint32_t row = hw_tid; row < N; row += stride) {
     TYPE max_val = S[row * N];
@@ -56,16 +56,16 @@ static void softmax_body(kernel_arg_t* __UNIFORM__ arg) {
   }
 }
 
-static void pv_body(kernel_arg_t* __UNIFORM__ arg) {
+static inline void kernel2_body(kernel_arg_t* arg) {
   auto P = reinterpret_cast<TYPE*>(arg->P_addr);
   auto V = reinterpret_cast<TYPE*>(arg->V_addr);
   auto O = reinterpret_cast<TYPE*>(arg->O_addr);
   auto N = arg->N;
   auto d = arg->d;
 
-  int col = blockIdx.x;
-  int row = blockIdx.y;
-  if (row >= (int)N || col >= (int)d) return;
+  uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= N || col >= d) return;
 
   TYPE sum(0);
   for (uint32_t e = 0; e < N; ++e) {
@@ -75,13 +75,20 @@ static void pv_body(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Single entry point — host selects the active stage via arg->kernel_id.
-// =============================================================================
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  __rdcycle_time t0 = vx_rdcycle_sync_begin();
+
   switch (arg->kernel_id) {
-    case KID_QK_SIMT: qk_body(arg);      break;
-    case KID_SOFTMAX: softmax_body(arg); break;
-    case KID_PV_SIMT: pv_body(arg);      break;
+    case KID_QK_SIMT: kernel0_body(arg); break;
+    case KID_SOFTMAX: kernel1_body(arg); break;
+    case KID_PV_SIMT: kernel2_body(arg); break;
     default: break;
+  }
+
+  __rdcycle_time t1 = vx_rdcycle_sync_end();
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
   }
 }
