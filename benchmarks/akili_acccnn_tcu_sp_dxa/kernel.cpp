@@ -15,7 +15,8 @@ using ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
 
 constexpr uint32_t kDescA    = 0;  // compressed A
 constexpr uint32_t kDescB    = 1;
-constexpr uint32_t kDescMeta = 2;  // packed 2:4 meta
+// Option B: no kDescMeta — metadata is read directly from DDR via the
+// load_matrix_sync fast-path, not staged through LMEM.
 
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   auto pC = reinterpret_cast<ctx::output_t*>(arg->O_addr);
@@ -41,32 +42,32 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 
   constexpr uint32_t stride_A_smem = ctx::tileK / 2;
 
-  // smem layout: [A tile (tileM × tileK/2) fp16] [B tile (tileN × tileK) fp16] [Meta tile (per_k_tile_words) uint32]
-  auto smem    = reinterpret_cast<ctx::input_t*>(__local_mem());
-  auto A_smem  = smem;
-  auto B_smem  = smem + ctx::tileM * stride_A_smem;
-  auto Meta_smem = reinterpret_cast<uint32_t*>(B_smem + ctx::tileN * ctx::tileK);
+  // smem layout: [A tile (tileM × tileK/2) fp16] [B tile (tileN × tileK) fp16]
+  // Option B: no LMEM region for Meta — it stays in DDR.
+  auto smem   = reinterpret_cast<ctx::input_t*>(__local_mem());
+  auto A_smem = smem;
+  auto B_smem = smem + ctx::tileM * stride_A_smem;
 
   vortex::barrier bar(0);
   const bool is_dxa_warp = (csr_read(VX_CSR_CTA_RANK) == 0);
 
   uint32_t num_k_tiles = K / ctx::tileK;
-  (void)num_k_tiles;
+  // Option B: walk a DDR metadata pointer, matching the WMMA reference.
+  auto pMetaDDR = reinterpret_cast<const float*>(arg->meta_W_addr)
+                + blockIdx.y * num_k_tiles * per_k_tile_words;
 
-  for (uint32_t i = 0, kt = 0; i < K; i += ctx::tileK, ++kt) {
+  for (uint32_t i = 0; i < K; i += ctx::tileK) {
     if (is_dxa_warp) {
-      // A: compressed, col-coord is in units of fp16 elements in the compressed
-      // buffer, so k_compressed = i / 2.
-      vx_dxa_issue_2d_wg(kDescA,    bar.id(), A_smem,    i / 2,                    tile_row);
-      vx_dxa_issue_2d_wg(kDescB,    bar.id(), B_smem,    i,                        tile_col);
-      vx_dxa_issue_2d_wg(kDescMeta, bar.id(), Meta_smem, kt * per_k_tile_words,    blockIdx.y);
+      vx_dxa_issue_2d_wg(kDescA, bar.id(), A_smem, i / 2, tile_row);
+      vx_dxa_issue_2d_wg(kDescB, bar.id(), B_smem, i,     tile_col);
     }
     bar.arrive_and_wait();
 
-    ctx::load_matrix_sync<vt::row_major>(fragA, A_smem, stride_A_smem, nullptr, Meta_smem);
+    ctx::load_matrix_sync<vt::row_major>(fragA, A_smem, stride_A_smem, nullptr, pMetaDDR);
     ctx::load_matrix_sync<vt::col_major>(fragB, B_smem, ctx::tileK);
     ctx::mma_sync(fragC, fragA, fragB, fragC);
 
+    pMetaDDR += per_k_tile_words;
     bar.arrive_and_wait();
   }
 

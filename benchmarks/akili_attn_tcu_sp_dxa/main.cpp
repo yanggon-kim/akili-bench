@@ -23,12 +23,11 @@
 #include <stdio.h>
 #include "common.h"
 
+// Option B: no Meta descriptors — metadata stays in DDR.
 constexpr uint32_t kDescA_QK    = 0;
 constexpr uint32_t kDescB_QK    = 1;
-constexpr uint32_t kDescMeta_QK = 2;
-constexpr uint32_t kDescA_PV    = 3;
-constexpr uint32_t kDescB_PV    = 4;
-constexpr uint32_t kDescMeta_PV = 5;
+constexpr uint32_t kDescA_PV    = 2;
+constexpr uint32_t kDescB_PV    = 3;
 
 #ifndef NUM_THREADS
 #define NUM_THREADS 8
@@ -348,8 +347,10 @@ int main(int argc, char* argv[]) {
   //   B (K):    [N × d] col-major-view, stored row-major N-by-d.
   //   Meta (Q): one linear row per output-tile-row, contents
   //             num_k_tiles × per_k_tile_words uint32 words, K-dim = d.
+  // Option B: no Meta descriptor. num_k_tiles / num_tile_rows only kept
+  // for kernel_arg reference — descriptor programming dropped.
   uint32_t qk_num_k_tiles = d / TK;
-  uint32_t qk_num_tile_rows = N / TM;
+  (void)qk_num_k_tiles;
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescA_QK, kernel_arg.Q_addr,
     /*size0=*/d / 2, /*size1=*/N,
     /*stride0_bytes=*/(d / 2) * sizeof(uint16_t),
@@ -358,17 +359,13 @@ int main(int argc, char* argv[]) {
     /*size0=*/d, /*size1=*/N,
     /*stride0_bytes=*/d * sizeof(uint16_t),
     /*tile0=*/TK, /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
-  RT_CHECK(vx_dxa_program_desc_2d(device, kDescMeta_QK, kernel_arg.meta_Q_addr,
-    /*size0=*/qk_num_k_tiles * per_k_tile_words, /*size1=*/qk_num_tile_rows,
-    /*stride0_bytes=*/qk_num_k_tiles * per_k_tile_words * sizeof(uint32_t),
-    /*tile0=*/per_k_tile_words, /*tile1=*/1, /*elem_bytes=*/sizeof(uint32_t)));
 
   int errors = 0;
   const float atol = 2e-2f;
   const float rtol = 2e-2f;
 
-  uint32_t gemm_smem_size = (TM * (TK / 2) + TN * TK) * sizeof(uint16_t)
-                          + per_k_tile_words * sizeof(uint32_t);
+  // Option B: LMEM is just A + B (no Meta region).
+  uint32_t gemm_smem_size = (TM * (TK / 2) + TN * TK) * sizeof(uint16_t);
 
   // ---------------- Stage 1: sparse QK ----------------
   std::cout << "=== Stage 1: S = Q @ K^T (sparse TCU, DXA) ===" << std::endl;
@@ -462,8 +459,9 @@ int main(int argc, char* argv[]) {
   //   A (Psp):  compressed [N × N/2] row-major.
   //   B (V):    [d × N] col-major-view, stored row-major d-by-N.
   //   Meta (P): K-dim = N here.
+  // Option B: no PV Meta descriptor.
   uint32_t pv_num_k_tiles = N / TK;
-  uint32_t pv_num_tile_rows = N / TM;
+  (void)pv_num_k_tiles;
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescA_PV, P_sp_addr,
     /*size0=*/N / 2, /*size1=*/N,
     /*stride0_bytes=*/(N / 2) * sizeof(uint16_t),
@@ -472,10 +470,6 @@ int main(int argc, char* argv[]) {
     /*size0=*/N, /*size1=*/d,
     /*stride0_bytes=*/N * sizeof(uint16_t),
     /*tile0=*/TK, /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
-  RT_CHECK(vx_dxa_program_desc_2d(device, kDescMeta_PV, kernel_arg.meta_P_addr,
-    /*size0=*/pv_num_k_tiles * per_k_tile_words, /*size1=*/pv_num_tile_rows,
-    /*stride0_bytes=*/pv_num_k_tiles * per_k_tile_words * sizeof(uint32_t),
-    /*tile0=*/per_k_tile_words, /*tile1=*/1, /*elem_bytes=*/sizeof(uint32_t)));
 
   kernel_arg.P_addr    = P_sp_addr;
   kernel_arg.kernel_id = KID_PV_SPARSE;

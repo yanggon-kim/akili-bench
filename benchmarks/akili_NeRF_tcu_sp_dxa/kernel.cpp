@@ -7,9 +7,9 @@
 #include "common.h"
 
 // DXA descriptor slots (programmed by host per MLP layer).
-constexpr uint32_t kDescA    = 0;  // compressed W [N_out x K_in/2] row-major
-constexpr uint32_t kDescB    = 1;  // activations X [K_in x n_points] row-major
-constexpr uint32_t kDescMeta = 2;  // packed 2:4 metadata
+// Option B: no kDescMeta — metadata stays in DDR.
+constexpr uint32_t kDescA = 0;  // compressed W [N_out x K_in/2] row-major
+constexpr uint32_t kDescB = 1;  // activations X [K_in x n_points] row-major
 
 // =============================================================================
 // akili_NeRF_tcu_sp — Full NeRF forward pass with the MLP GEMMs on the SPARSE
@@ -121,30 +121,34 @@ static inline void mlp_gemm_body(kernel_arg_t* arg) {
   constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_TCU_LANES;
   constexpr uint32_t stride_A_smem = sp_ctx::tileK / 2;
 
-  // SMEM: compressed A tile [tileM × tileK/2] + B tile [tileK × tileN] + meta tile.
-  auto smem      = reinterpret_cast<sp_ctx::input_t*>(__local_mem());
-  auto A_smem    = smem;
-  auto B_smem    = smem + sp_ctx::tileM * stride_A_smem;
-  auto Meta_smem = reinterpret_cast<uint32_t*>(B_smem + sp_ctx::tileK * sp_ctx::tileN);
+  // Option B: SMEM is just [A tile][B tile] — Meta stays in DDR.
+  auto smem   = reinterpret_cast<sp_ctx::input_t*>(__local_mem());
+  auto A_smem = smem;
+  auto B_smem = smem + sp_ctx::tileM * stride_A_smem;
 
   vortex::barrier bar(0);
   const bool is_dxa_warp = (csr_read(VX_CSR_CTA_RANK) == 0);
 
-  for (uint32_t i = 0, kt = 0; i < K_in; i += sp_ctx::tileK, ++kt) {
+  // Option B: per-CTA DDR Meta pointer, walks per k-tile.
+  uint32_t num_k_tiles = K_in / sp_ctx::tileK;
+  (void)num_k_tiles;
+  auto pMetaDDR = reinterpret_cast<const float*>(arg->meta_cur_addr)
+                + blockIdx.y * num_k_tiles * per_k_tile_words;
+
+  for (uint32_t i = 0; i < K_in; i += sp_ctx::tileK) {
     if (is_dxa_warp) {
       // A compressed (N_out × K_in/2 row-major): tile at (row=tile_row, col=i/2).
-      vx_dxa_issue_2d_wg(kDescA,    bar.id(), A_smem,    i / 2,                 tile_row);
+      vx_dxa_issue_2d_wg(kDescA, bar.id(), A_smem, i / 2,    tile_row);
       // B row-major (K_in × n_points): tile at (row=i, col=tile_col).
-      vx_dxa_issue_2d_wg(kDescB,    bar.id(), B_smem,    tile_col,              i);
-      // Meta: one linear row per output M-tile; fetch per_k_tile_words at kt.
-      vx_dxa_issue_2d_wg(kDescMeta, bar.id(), Meta_smem, kt * per_k_tile_words, blockIdx.y);
+      vx_dxa_issue_2d_wg(kDescB, bar.id(), B_smem, tile_col, i);
     }
     bar.arrive_and_wait();
 
-    sp_ctx::load_matrix_sync<vt::row_major>(fragA, A_smem, stride_A_smem, nullptr, Meta_smem);
+    sp_ctx::load_matrix_sync<vt::row_major>(fragA, A_smem, stride_A_smem, nullptr, pMetaDDR);
     sp_ctx::load_matrix_sync(fragB, B_smem, sp_ctx::tileN);
     sp_ctx::mma_sync(fragC, fragA, fragB, fragC);
 
+    pMetaDDR += per_k_tile_words;
     bar.arrive_and_wait();
   }
 

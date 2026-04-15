@@ -18,13 +18,12 @@
 namespace vt = vortex::tensor;
 using ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
 
-// Descriptor slots.
+// Descriptor slots. Option B: no Meta descriptors — metadata is read
+// directly from DDR via the load_matrix_sync fast-path.
 constexpr uint32_t kDescA_QK    = 0;
 constexpr uint32_t kDescB_QK    = 1;
-constexpr uint32_t kDescMeta_QK = 2;
-constexpr uint32_t kDescA_PV    = 3;
-constexpr uint32_t kDescB_PV    = 4;
-constexpr uint32_t kDescMeta_PV = 5;
+constexpr uint32_t kDescA_PV    = 2;
+constexpr uint32_t kDescB_PV    = 3;
 
 // =============================================================================
 // Stage 2: SIMT softmax on fp32 S. No DXA, no smem.
@@ -70,10 +69,10 @@ static void softmax_body(kernel_arg_t* __UNIFORM__ arg) {
 static inline void sparse_mma_dxa(ctx::input_t*  pA_unused,
                                   ctx::input_t*  pB_unused,
                                   ctx::output_t* pC_base,
-                                  const float*   pMeta_unused,
+                                  const float*   pMeta_base,
                                   uint32_t K_walk, uint32_t c_stride,
-                                  uint32_t A_desc, uint32_t B_desc, uint32_t Meta_desc) {
-  (void)pA_unused; (void)pB_unused; (void)pMeta_unused;
+                                  uint32_t A_desc, uint32_t B_desc) {
+  (void)pA_unused; (void)pB_unused;
 
   ctx::fragment_a   fragA;
   ctx::fragment_b   fragB;
@@ -93,28 +92,31 @@ static inline void sparse_mma_dxa(ctx::input_t*  pA_unused,
 
   constexpr uint32_t stride_A_smem = ctx::tileK / 2;
 
-  // smem layout: [A tile fp16 (tileM × tileK/2)] [B tile fp16 (tileN × tileK)]
-  //              [Meta tile uint32 (per_k_tile_words)]
-  auto smem      = reinterpret_cast<ctx::input_t*>(__local_mem());
-  auto A_smem    = smem;
-  auto B_smem    = smem + ctx::tileM * stride_A_smem;
-  auto Meta_smem = reinterpret_cast<uint32_t*>(B_smem + ctx::tileN * ctx::tileK);
+  // Option B: smem layout is just [A tile][B tile] — Meta stays in DDR.
+  auto smem   = reinterpret_cast<ctx::input_t*>(__local_mem());
+  auto A_smem = smem;
+  auto B_smem = smem + ctx::tileM * stride_A_smem;
 
   vortex::barrier bar(0);
   const bool is_dxa_warp = (csr_read(VX_CSR_CTA_RANK) == 0);
 
-  for (uint32_t i = 0, kt = 0; i < K_walk; i += ctx::tileK, ++kt) {
+  // Option B: per-CTA DDR Meta pointer — walks per k-tile, matching WMMA ref.
+  uint32_t num_k_tiles = K_walk / ctx::tileK;
+  (void)num_k_tiles;
+  auto pMetaDDR = pMeta_base + blockIdx.y * num_k_tiles * per_k_tile_words;
+
+  for (uint32_t i = 0; i < K_walk; i += ctx::tileK) {
     if (is_dxa_warp) {
-      vx_dxa_issue_2d_wg(A_desc,    bar.id(), A_smem,    i / 2,                 tile_row);
-      vx_dxa_issue_2d_wg(B_desc,    bar.id(), B_smem,    i,                     tile_col);
-      vx_dxa_issue_2d_wg(Meta_desc, bar.id(), Meta_smem, kt * per_k_tile_words, blockIdx.y);
+      vx_dxa_issue_2d_wg(A_desc, bar.id(), A_smem, i / 2, tile_row);
+      vx_dxa_issue_2d_wg(B_desc, bar.id(), B_smem, i,     tile_col);
     }
     bar.arrive_and_wait();
 
-    ctx::load_matrix_sync<vt::row_major>(fragA, A_smem, stride_A_smem, nullptr, Meta_smem);
+    ctx::load_matrix_sync<vt::row_major>(fragA, A_smem, stride_A_smem, nullptr, pMetaDDR);
     ctx::load_matrix_sync<vt::col_major>(fragB, B_smem, ctx::tileK);
     ctx::mma_sync(fragC, fragA, fragB, fragC);
 
+    pMetaDDR += per_k_tile_words;
     bar.arrive_and_wait();
   }
 
@@ -131,7 +133,7 @@ static void qk_sparse_body(kernel_arg_t* __UNIFORM__ arg) {
   auto pC = reinterpret_cast<ctx::output_t*>(arg->S_addr);
   auto pM = reinterpret_cast<const float*>(arg->meta_Q_addr);
   sparse_mma_dxa(pA, pB, pC, pM, arg->d, arg->N,
-                 kDescA_QK, kDescB_QK, kDescMeta_QK);
+                 kDescA_QK, kDescB_QK);
 }
 
 // =============================================================================
@@ -143,7 +145,7 @@ static void pv_sparse_body(kernel_arg_t* __UNIFORM__ arg) {
   auto pC = reinterpret_cast<ctx::output_t*>(arg->O_addr);
   auto pM = reinterpret_cast<const float*>(arg->meta_P_addr);
   sparse_mma_dxa(pA, pB, pC, pM, arg->N, arg->d,
-                 kDescA_PV, kDescB_PV, kDescMeta_PV);
+                 kDescA_PV, kDescB_PV);
 }
 
 // =============================================================================

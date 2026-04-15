@@ -376,15 +376,14 @@ int main(int argc, char* argv[]) {
     /*size0=*/K_gemm, /*size1=*/N_gemm,
     /*stride0_bytes=*/K_gemm * sizeof(uint16_t),
     /*tile0=*/TK, /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
-  RT_CHECK(vx_dxa_program_desc_2d(device, kDescMeta, kernel_arg.meta_W_addr,
-    /*size0=*/num_k_tiles * per_k_tile_words, /*size1=*/num_tile_rows,
-    /*stride0_bytes=*/num_k_tiles * per_k_tile_words * sizeof(uint32_t),
-    /*tile0=*/per_k_tile_words, /*tile1=*/1, /*elem_bytes=*/sizeof(uint32_t)));
+  // Option B: no kDescMeta descriptor — metadata is read directly from DDR
+  // by the sparse load_matrix_sync fast-path, so only A and B need DXA staging.
+  (void)num_k_tiles; (void)num_tile_rows; (void)per_k_tile_words;
 
   uint32_t grid_dim[2]  = {N_gemm / TN, M_gemm / TM};
   uint32_t block_dim[2] = {NUM_THREADS, 1};
-  uint32_t smem_size    = (TM * (TK / 2) + TN * TK) * sizeof(uint16_t)
-                        + per_k_tile_words * sizeof(uint32_t);
+  // LMEM footprint shrinks — no Meta region.
+  uint32_t smem_size    = (TM * (TK / 2) + TN * TK) * sizeof(uint16_t);
 
   RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, smem_size));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
