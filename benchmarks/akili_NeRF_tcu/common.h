@@ -23,10 +23,17 @@
 #define PE_L             4
 #define MLP_IN_DIM       27
 #define MLP_IN_DIM_PAD   32     // must be multiple of tileK = 16 (dense)
-#define MLP_W            64     // hidden width, multiple of tileM=tileN=8
+#define MLP_W            256    // hidden width, multiple of tileM=tileN at all NTs
 #define MLP_DEPTH        4
 #define MLP_OUT_DIM      4
-#define MLP_OUT_DIM_PAD  8      // padded to tileM = 8
+#ifndef NUM_THREADS
+#define NUM_THREADS 8
+#endif
+#if NUM_THREADS >= 16
+#define MLP_OUT_DIM_PAD  16     // padded to tileM = 16 at NT=16/32
+#else
+#define MLP_OUT_DIM_PAD  8      // padded to tileM = 8 at NT=8
+#endif
 
 typedef struct {
   // ---- Stage 1 (ray setup) I/O ----

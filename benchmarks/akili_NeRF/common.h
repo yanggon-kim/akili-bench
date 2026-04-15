@@ -18,7 +18,7 @@
 //   output head   : 32 -> 4 (sigma + RGB logits)
 #define PE_L        4
 #define MLP_IN_DIM  27
-#define MLP_W       64
+#define MLP_W       256
 #define MLP_DEPTH   4
 #define MLP_OUT_DIM 4
 
