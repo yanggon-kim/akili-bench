@@ -9,12 +9,8 @@ VX_SRCS := matmul_kernel.cpp
 SIMX_RT_CONFIG := $(VORTEX_BUILD)/runtime/simx_rt_config.stamp
 SIMX_NUM_THREADS := $(strip $(shell [ -f "$(SIMX_RT_CONFIG)" ] && grep -o -- '-DNUM_THREADS=[0-9]*' "$(SIMX_RT_CONFIG)" | head -1 | cut -d= -f2))
 
-NUM_THREADS ?= 8
+NUM_THREADS ?= $(if $(SIMX_NUM_THREADS),$(SIMX_NUM_THREADS),8)
 CONFIGS += -DNUM_THREADS=$(NUM_THREADS) -DEXT_TCU_ENABLE -DTCU_SPARSE_ENABLE -DITYPE=fp16 -DOTYPE=fp32
-ifneq ($(SIMX_NUM_THREADS),)
-override CONFIGS := $(filter-out -DNUM_THREADS=%,$(CONFIGS))
-CONFIGS += -DNUM_THREADS=$(SIMX_NUM_THREADS)
-endif
 
 KERNEL_LIB := vortex2
 

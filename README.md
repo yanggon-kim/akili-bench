@@ -1,6 +1,6 @@
 # Akili Benchmarks — quick start for collaborators
 
-I've added a set of nine self-contained Vortex benchmarks on this repo. They
+I've added a set of fifteen self-contained Vortex benchmarks on this repo. They
 cover **attention**, **FlashAttention**, and **2D convolution**, with three
 separate test directories per workload (SIMT, dense TCU, sparse 2:4 TCU).
 Each directory is independent — it has its own `main.cpp`, `kernel.cpp`,
@@ -18,7 +18,7 @@ cd akili-bench
 git checkout akili
 ```
 
-## The twelve tests
+## The fifteen tests
 
 All twelve live under `benchmarks/` once you're on the branch:
 
@@ -50,10 +50,51 @@ The `00_doc/` directory in this repo has everything you need:
 - **`00_doc/benchmark_status.md`** — implementation status and
   per-directory build-configuration details (which dirs need
   `ENABLE_TCU`, which need softfloat, how the shared simx build serves
-  all nine tests, etc.). Read this if you're extending the benchmarks or
+  all fifteen tests, etc.). Read this if you're extending the benchmarks or
   debugging build errors.
 - **`00_doc/speedup_results_akili.csv`** — raw speedup data backing the
   tables in `akili_benchmarks.md`, one row per (workload × shape).
+
+## Matrix runner
+
+For full simx sweeps across the top-level `akili_*` benchmarks, use
+`run_akili_simx_matrix.sh` from the repo root:
+
+```bash
+./run_akili_simx_matrix.sh
+```
+
+Default behavior:
+
+- discovers every top-level `benchmarks/akili_*` directory, including the
+  three `akili_llama2*` variants and the NeRF trio
+- sweeps `NUM_THREADS=4,8,16,32`
+- launches the selected benchmarks in parallel within each thread-count suite
+- builds a separate Vortex simx tree per thread-count suite so `nt=4`, `nt=8`,
+  `nt=16`, and `nt=32` never reuse the wrong runtime configuration
+- uses fast sanity-size inputs by default so the full sweep is practical
+- keeps workload sizes configurable via `--attn-opts`, `--flash-opts`,
+  `--cnn-opts`, `--nerf-opts`, `--llama-opts`, or repeatable
+  `--benchmark-opts akili_name="..."`
+- writes results under `~/results/` by default instead of inside the repo
+
+Important measurement caveat:
+
+- `results.csv` records the final `PERF:` line emitted by each binary
+- for single-launch benchmarks such as `akili_cnn` / `akili_acccnn_tcu*` and
+  the `akili_llama2*` family, that `PERF` line is a reasonable end-to-end
+  cycle metric
+- for multi-stage benchmarks such as `akili_attn*`, `akili_flash_tcu*`, and
+  `akili_NeRF*`, end-to-end comparison should use the benchmark-owned
+  `KCYC[...]` stage totals instead of the final `PERF:` line alone
+
+Useful entry points:
+
+```bash
+./run_akili_simx_matrix.sh --list
+./run_akili_simx_matrix.sh --dry-run
+./run_akili_simx_matrix.sh --threads 8 --benchmark-opts akili_flash_tcu="-n 64 -d 512"
+```
 
 ## TL;DR to run one
 

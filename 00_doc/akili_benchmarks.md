@@ -1,6 +1,6 @@
 # Akili Benchmarks — User Guide
 
-This document describes the twelve `akili_*` benchmarks that ship with
+This document describes the fifteen `akili_*` benchmarks that ship with
 Vortex Sparse TCU under `tests/bench_dir/bench/benchmarks/`. Each
 benchmark is a **self-contained test directory** that builds a single
 binary for one `(workload, hardware variant)` pair. Use these if you
@@ -14,9 +14,29 @@ All paths in this document are **relative to the Vortex source root**
 (`vortex/`). No absolute paths, so everything works from
 any clone.
 
+For a repo-level simx sweep, `tests/bench_dir/akili-bench/run_akili_simx_matrix.sh`
+discovers the top-level `akili_*` benchmarks, sweeps a configurable thread list
+(`4,8,16,32` by default), and launches the selected benchmarks in parallel
+within each thread-count suite. Its default workload profile is intentionally
+fast; use `--attn-opts`, `--flash-opts`, `--cnn-opts`, `--nerf-opts`,
+`--llama-opts`, or `--benchmark-opts akili_name="..."` when you want larger
+manual shapes. By default it writes results to `~/results/` rather than inside
+the repo, so benchmark output does not bloat the checkout. The runner also
+creates a separate Vortex build tree per thread-count suite, so `nt=4`,
+`nt=8`, `nt=16`, and `nt=32` do not accidentally share a mismatched simx
+runtime.
+
+Runner measurement caveat: the generated `results.csv` stores the final
+`PERF:` line printed by each benchmark. That is fine for single-launch tests
+such as `akili_cnn` / `akili_acccnn_tcu*` and the `akili_llama2*` family, but
+it is not an end-to-end cycle metric for multi-stage benchmarks such as
+`akili_attn*`, `akili_flash_tcu*`, and `akili_NeRF*`. For those, use the
+benchmark-owned `KCYC[...]` stage counts and sum the stages when comparing
+SIMT vs dense/sparse TCU.
+
 ---
 
-## 1. What the nine tests are
+## 1. What the fifteen tests are
 
 ### Attention  (unfused 3-stage: Q·Kᵀ → softmax → P·V)
 
@@ -45,6 +65,15 @@ any clone.
 Every benchmark prints per-stage cycle counts via `KCYC[...,nt=<NT>]`
 and a final `PASSED!` or `FAILED!` after comparing the device output
 against a fp32 CPU reference.
+
+The repo-level matrix runner now also includes the three NeRF benchmarks:
+
+| Workload | SIMT | Dense TCU | Sparse TCU (2:4) |
+|---|---|---|---|
+| **NeRF** | `benchmarks/akili_NeRF/` | `benchmarks/akili_NeRF_tcu/` | `benchmarks/akili_NeRF_tcu_sp/` |
+
+NeRF uses `-r` for ray count and `-s` for samples per ray. The runner's
+default sanity profile keeps the benchmark Makefile default of `-r 32 -s 8`.
 
 ---
 
@@ -102,10 +131,10 @@ Each akili_* directory is independent. From the Vortex source root:
 make -C tests/bench_dir/bench/benchmarks/akili_attn -s NUM_THREADS=8
 ```
 
-Replace `akili_attn` with any of the nine dir names. The
+Replace `akili_attn` with any of the fifteen dir names. The
 `NUM_THREADS=8` argument must match the simx build's warp width.
 
-### 2.5 Build all nine benchmarks at once
+### 2.5 Build all fifteen benchmarks at once
 
 ```bash
 BENCH=tests/bench_dir/bench/benchmarks
@@ -210,7 +239,7 @@ within the per-mode tolerance. Sparse TCU uses a looser tolerance
 
 ## 5. Measured speedups (NT=8, simx, KMU launch API)
 
-> **Measurement note — KMU era.** All 12 `akili_*` binaries migrated
+> **Measurement note — KMU era.** All 15 `akili_*` binaries migrated
 > to the Vortex **KMU** (Kernel Management Unit) launch API in April
 > 2026. On the old launch path each stage reported
 > `KCYC[TAG,nt=N]: <total>` where `<total>` was the per-spawn duration

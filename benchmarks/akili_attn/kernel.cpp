@@ -34,9 +34,8 @@ static inline void kernel1_body(kernel_arg_t* arg) {
   auto P = reinterpret_cast<TYPE*>(arg->P_addr);
   uint32_t N = arg->N;
 
-  uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= N) return;
-
+  uint32_t hw_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t stride = gridDim.x * blockDim.x;
   for (uint32_t row = hw_tid; row < N; row += stride) {
     TYPE max_val = S[row * N];
     for (uint32_t col = 1; col < N; ++col) {
