@@ -30,9 +30,13 @@ using itype_t = typename vt::fp16::dtype;
 using otype_t = typename vt::fp32::dtype;
 
 // DXA descriptor slots (consumed by the device kernel).
+// Fix M2: kDescMeta is re-introduced but with a *per-M-tile slab* shape —
+// one DXA issue per CTA copies all num_k_tiles × per_k_tile_words uint32
+// words into Meta_smem. The k-loop then reads meta from SMEM instead of
+// DDR, removing the per-k-iter LSU stall that Option B still paid.
 constexpr uint32_t kDescA    = 0;  // compressed A [M × K/2]
 constexpr uint32_t kDescB    = 1;  // dense B [K × N] row-major
-constexpr uint32_t kDescMeta = 2;  // 2:4 metadata, one row per M-tile
+constexpr uint32_t kDescMeta = 2;  // packed 2:4 meta, full per-M-tile slab
 
 // Meta sizing — mirrors baseline pack_metadata and the per-k-tile layout.
 static constexpr uint32_t kPerKTileWords = []{
@@ -395,18 +399,21 @@ static SparseWeight* get_or_create_ffn_weight(const float* w1,
     return raw_weight;
 }
 
-// Program DXA 2D descriptors for compressed A, dense row-major B, and meta.
+// Program DXA 2D descriptors for compressed A, dense row-major B, and the
+// per-M-tile meta slab.
 //   A (compressed): [padded_M × padded_K/2] row-major, tile (tileM × tileK/2),
 //                   stride = (padded_K/2) * sizeof(itype)
 //   B             : [padded_K × padded_N] row-major,   tile (tileK × tileN),
 //                   stride = padded_N * sizeof(itype)
-//   Meta          : one linear row per M-tile, each of
-//                   num_k_tiles × per_k_tile_words uint32 words.
+//   Meta (M2)     : [num_tile_rows × num_k_tiles × kPerKTileWords] uint32,
+//                   tile = full slab (num_k_tiles × kPerKTileWords),
+//                   so one issue copies an entire M-tile row of meta.
 static void program_dxa_descriptors(const SparseWeight* weight, uint32_t padded_N) {
-    uint32_t padded_M = weight->padded_rows;
     uint32_t padded_K = weight->padded_cols;
+    uint32_t padded_M = weight->padded_rows;
     uint32_t num_tile_rows = padded_M / cfg::tileM;
     uint32_t num_k_tiles   = padded_K / cfg::tileK;
+    uint32_t slab_words    = num_k_tiles * kPerKTileWords;
 
     RT_CHECK(vx_dxa_program_desc_2d(device, kDescA, weight->data_addr,
         /*size0=*/padded_K / 2, /*size1=*/padded_M,
@@ -421,9 +428,9 @@ static void program_dxa_descriptors(const SparseWeight* weight, uint32_t padded_
         /*elem_bytes=*/sizeof(itype_t)));
 
     RT_CHECK(vx_dxa_program_desc_2d(device, kDescMeta, weight->meta_addr,
-        /*size0=*/num_k_tiles * kPerKTileWords, /*size1=*/num_tile_rows,
-        /*stride0_bytes=*/num_k_tiles * kPerKTileWords * sizeof(uint32_t),
-        /*tile0=*/kPerKTileWords, /*tile1=*/1,
+        /*size0=*/slab_words, /*size1=*/num_tile_rows,
+        /*stride0_bytes=*/slab_words * sizeof(uint32_t),
+        /*tile0=*/slab_words, /*tile1=*/1,
         /*elem_bytes=*/sizeof(uint32_t)));
 }
 
@@ -473,9 +480,11 @@ static void run_sparse_matmul(float* C,
     uint32_t grid_dim[2] = {padded_N / cfg::tileN, weight->padded_rows / cfg::tileM};
     uint32_t block_dim[2] = {NUM_THREADS, 1};
     // SMEM: A tile (tileM × tileK/2) fp16 + B tile (tileK × tileN) fp16 +
-    //       Meta tile (per_k_tile_words uint32).
+    //       Meta prefetch buffer (num_k_tiles × per_k_tile_words uint32).
+    // Fix M1 prefetches all per-CTA metadata to SMEM once at CTA entry.
+    uint32_t num_k_tiles_per_cta = weight->padded_cols / cfg::tileK;
     uint32_t smem_size = (cfg::tileM * (cfg::tileK / 2) + cfg::tileK * cfg::tileN) * sizeof(itype_t)
-                       + kPerKTileWords * sizeof(uint32_t);
+                       + num_k_tiles_per_cta * kPerKTileWords * sizeof(uint32_t);
 
     RT_CHECK(vx_start_g(device, matmul_krnl_buffer, matmul_args_buffer, 2,
                         grid_dim, block_dim, smem_size));

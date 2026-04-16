@@ -2,11 +2,11 @@
 // Sparse TCU GEMM (2:4 on A) with:
 //   A compressed row-major [M × K/2]  (stride K/2), tile (tileM × tileK/2)
 //   B dense     row-major [K × N]     (stride N),   tile (tileK × tileN)
-//   Meta packed: per M-tile row, one linear run of
-//                num_k_tiles × per_k_tile_words uint32 words.
+//   Meta: all per-CTA 2:4 metadata is prefetched into SMEM via a single
+//         DXA issue at CTA entry (Fix M2). The k-loop then reads meta
+//         from SMEM instead of DDR, which otherwise dominated the LSU
+//         stall at 80-cycle avg load latency (vs. 40-cycle dense).
 //   C dense     row-major [M × N].
-//
-// Mirrors akili_acccnn_tcu_sp_dxa but with row-major B (llama2 layout).
 
 #include <vx_spawn2.h>
 #include <vx_tensor.h>
@@ -20,9 +20,12 @@ using ctx = vt::wmma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE, true>;
 using kcfg = vt::wmma_config_t<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
 
 // DXA descriptor slots (programmed by host in vxmath.cpp).
+// Fix M2: re-add kDescMeta, but issued ONCE per CTA with a full per-M-tile
+// meta slab. This is distinct from the original buggy pattern which issued
+// kDescMeta per-k-iter inside the hot loop.
 constexpr uint32_t kDescA    = 0;  // compressed A
 constexpr uint32_t kDescB    = 1;  // dense row-major B
-constexpr uint32_t kDescMeta = 2;  // packed 2:4 meta
+constexpr uint32_t kDescMeta = 2;  // full per-M-tile meta slab (issued once)
 
 extern "C" void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
     auto pC = reinterpret_cast<ctx::output_t*>(args->C_addr);
@@ -46,10 +49,7 @@ extern "C" void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
 
     constexpr uint32_t stride_A_smem = ctx::tileK / 2;
 
-    // SMEM layout:
-    //   A_smem   : [tileM × tileK/2] fp16 row-major (compressed)
-    //   B_smem   : [tileK × tileN]   fp16 row-major
-    //   Meta_smem: per_k_tile_words uint32 words
+    // SMEM layout: [A tile][B tile][Meta (all k-tiles for this M-tile row)].
     auto smem      = reinterpret_cast<ctx::input_t*>(__local_mem());
     auto A_smem    = smem;
     auto B_smem    = smem + ctx::tileM * stride_A_smem;
@@ -58,24 +58,28 @@ extern "C" void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
     vortex::barrier bar(0);
     const bool is_dxa_warp = (csr_read(VX_CSR_CTA_RANK) == 0);
 
-    for (uint32_t k = 0, kt = 0; k < K; k += ctx::tileK, ++kt) {
-        // Issue DXA copies in each descriptor's 2D index space:
-        //   A compressed (M × K/2 row-major): (row=tile_row, col=k/2).
-        //   B row-major  (K × N):             (row=k,        col=tile_col).
-        //   Meta: one row per output M-tile, column stride per_k_tile_words.
+    // Fix M2: one-shot DXA prefetch of the full per-M-tile meta slab
+    // at CTA entry. Costs one extra barrier but keeps Meta DXA isolated
+    // from the A/B DXA pipeline so the k-loop sees no Meta stall.
+    if (is_dxa_warp) {
+        vx_dxa_issue_2d_wg(kDescMeta, bar.id(), Meta_smem, 0, blockIdx.y);
+    }
+    bar.arrive_and_wait();
+
+    auto pMetaCur = reinterpret_cast<const float*>(Meta_smem);
+
+    for (uint32_t k = 0; k < K; k += ctx::tileK) {
         if (is_dxa_warp) {
-            vx_dxa_issue_2d_wg(kDescA,    bar.id(), A_smem,    k / 2,                  tile_row);
-            vx_dxa_issue_2d_wg(kDescB,    bar.id(), B_smem,    tile_col,               k);
-            vx_dxa_issue_2d_wg(kDescMeta, bar.id(), Meta_smem, kt * per_k_tile_words,  blockIdx.y);
+            vx_dxa_issue_2d_wg(kDescA, bar.id(), A_smem, k / 2,    tile_row);
+            vx_dxa_issue_2d_wg(kDescB, bar.id(), B_smem, tile_col, k);
         }
         bar.arrive_and_wait();
 
-        // Sparse fragA load consumes the packed meta tile from smem.
-        // B fragment load is row-major (default), stride = tileN.
-        ctx::load_matrix_sync<vt::row_major>(fragA, A_smem, stride_A_smem, nullptr, Meta_smem);
+        ctx::load_matrix_sync<vt::row_major>(fragA, A_smem, stride_A_smem, nullptr, pMetaCur);
         ctx::load_matrix_sync<vt::row_major>(fragB, B_smem, ctx::tileN);
         ctx::mma_sync(fragC, fragA, fragB, fragC);
 
+        pMetaCur += per_k_tile_words;  // const float* walks in 4-byte units
         bar.arrive_and_wait();
     }
 
