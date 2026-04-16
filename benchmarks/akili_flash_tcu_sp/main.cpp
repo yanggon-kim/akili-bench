@@ -1,4 +1,4 @@
-// akili_flash_tcu_sp — Sparse TCU attention (2:4 on both Q and P).
+// akili_attn_tcu_sp — Sparse TCU attention (2:4 on both Q and P).
 //
 // Three kernel launches per run:
 //   Stage 1: sparse Q·Kᵀ  (host pre-prunes Q on the device upload path)
@@ -33,6 +33,22 @@ using cfg = vt::wmma_config_t<NUM_TCU_LANES, vt::fp16, vt::fp32>;
 static constexpr uint32_t TM = cfg::tileM;
 static constexpr uint32_t TN = cfg::tileN;
 static constexpr uint32_t TK = cfg::tileK;
+
+// Tile col-major B into contiguous tileK×tileN blocks for cache-friendly
+// sparse fragB loads. Block(n_tile, k_tile) stored col-major with stride=tileK.
+static void tile_B_colmajor(std::vector<uint16_t>& B_tiled,
+                            const std::vector<uint16_t>& B_cm,
+                            uint32_t K_walk, uint32_t N_cols) {
+  uint32_t num_k_tiles = K_walk / TK;
+  uint32_t num_n_tiles = N_cols / TN;
+  B_tiled.resize(K_walk * N_cols);
+  uint32_t offset = 0;
+  for (uint32_t nt = 0; nt < num_n_tiles; ++nt)
+    for (uint32_t kt = 0; kt < num_k_tiles; ++kt)
+      for (uint32_t col = 0; col < TN; ++col)
+        for (uint32_t row = 0; row < TK; ++row)
+          B_tiled[offset++] = B_cm[(nt * TN + col) * K_walk + kt * TK + row];
+}
 
 // -----------------------------------------------------------------------------
 // pack_metadata — lifted verbatim from tests/regression/sgemm_tcu_sp/main.cpp.
@@ -195,7 +211,7 @@ vx_buffer_h args_buffer  = nullptr;
 kernel_arg_t kernel_arg  = {};
 
 static void show_usage() {
-  std::cout << "akili_flash_tcu_sp — Sparse TCU attention benchmark" << std::endl;
+  std::cout << "akili_attn_tcu_sp — Sparse TCU attention benchmark" << std::endl;
   std::cout << "Usage: [-n N] [-d D] [-k kernel_file]" << std::endl;
 }
 
@@ -257,7 +273,7 @@ int main(int argc, char* argv[]) {
   uint32_t d_align = std::max(TK, TN);
   uint32_t N = round_up(N_req, n_align);
   uint32_t d = round_up(d_req, d_align);
-  std::cout << "akili_flash_tcu_sp — padded N=" << N << " (req " << N_req
+  std::cout << "akili_attn_tcu_sp — padded N=" << N << " (req " << N_req
             << "), d=" << d << " (req " << d_req << "), "
             << "TM=" << TM << " TN=" << TN << " TK=" << TK << std::endl;
 
@@ -292,7 +308,7 @@ int main(int argc, char* argv[]) {
   std::vector<uint32_t> h_meta_Q;
   pack_metadata(h_meta_Q, sparse_masks_Q, N, d);
 
-  // ---- Pack K (col-major) and V (col-major) as fp16 ----
+  // ---- Pack K (col-major) and V (col-major) as fp16, then tile for cache ----
   std::vector<uint16_t> h_K_cm(N * d);
   std::vector<uint16_t> h_V_cm(N * d);
   for (uint32_t n = 0; n < N; ++n)
@@ -301,6 +317,12 @@ int main(int argc, char* argv[]) {
   for (uint32_t d_idx = 0; d_idx < d; ++d_idx)
     for (uint32_t n = 0; n < N; ++n)
       h_V_cm[d_idx * N + n] = f2h_host(h_V[n * d + d_idx]);
+
+  // Tile K and V into contiguous tileK×tileN blocks.
+  // QK stage: B=K, K_walk=d, N_cols=N. PV stage: B=V, K_walk=N, N_cols=d.
+  std::vector<uint16_t> h_K_tiled, h_V_tiled;
+  tile_B_colmajor(h_K_tiled, h_K_cm, d, N);
+  tile_B_colmajor(h_V_tiled, h_V_cm, N, d);
 
   // ---- Allocate device buffers ----
   uint32_t qsp_bytes   = (uint32_t)h_Q_compressed.size() * sizeof(uint16_t);
@@ -338,8 +360,8 @@ int main(int argc, char* argv[]) {
 
   RT_CHECK(vx_copy_to_dev(Qsp_buffer, h_Q_compressed.data(), 0, qsp_bytes));
   RT_CHECK(vx_copy_to_dev(meta_Q_buf, h_meta_Q.data(),       0, q_meta_bytes));
-  RT_CHECK(vx_copy_to_dev(K_fp16_buf, h_K_cm.data(),         0, in_fp16_bytes));
-  RT_CHECK(vx_copy_to_dev(V_fp16_buf, h_V_cm.data(),         0, in_fp16_bytes));
+  RT_CHECK(vx_copy_to_dev(K_fp16_buf, h_K_tiled.data(),      0, in_fp16_bytes));
+  RT_CHECK(vx_copy_to_dev(V_fp16_buf, h_V_tiled.data(),     0, in_fp16_bytes));
 
   RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_mem_alloc(device, sizeof(kernel_arg_t), VX_MEM_READ_WRITE, &args_buffer));

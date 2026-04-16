@@ -47,14 +47,19 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   auto pTileA = pA + tile_row * stride_A;
   constexpr uint32_t a_k_stride = sp_ctx::tileK / 2;
 
-  auto pTileB = pB + tile_col * K;
+  // B is pre-tiled by the host into contiguous tileK×tileN col-major blocks.
+  // Block(n_tile, k_tile) at offset (n_tile * num_k_tiles + k_tile) * block_elems.
+  // Stride within block = tileK (not K), giving tight cache reads.
+  constexpr uint32_t block_elems = sp_ctx::tileK * sp_ctx::tileN;
+  uint32_t n_tile = blockIdx.x;
   for (int i = 0; i < (int)K; i += (int)sp_ctx::tileK) {
+    uint32_t k_tile = (uint32_t)i / sp_ctx::tileK;
+    auto pTileB = pB + (n_tile * num_k_tiles + k_tile) * block_elems;
     sp_ctx::load_matrix_sync<vt::row_major>(fragA, pTileA, stride_A, nullptr, pMetaSp);
-    sp_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, K);
+    sp_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, sp_ctx::tileK);
     sp_ctx::mma_sync(fragC, fragA, fragB, fragC);
     pMetaSp += per_k_tile_words;
     pTileA  += a_k_stride;
-    pTileB  += sp_ctx::tileK;
   }
 
   auto pTileC = pC + tile_row * N + tile_col;

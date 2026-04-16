@@ -33,6 +33,22 @@ static constexpr uint32_t TM = cfg::tileM;
 static constexpr uint32_t TN = cfg::tileN;
 static constexpr uint32_t TK = cfg::tileK;
 
+// Tile col-major B into contiguous tileK×tileN blocks for cache-friendly
+// sparse fragB loads. Block(n_tile, k_tile) stored col-major with stride=tileK.
+static void tile_B_colmajor(std::vector<uint16_t>& B_tiled,
+                            const std::vector<uint16_t>& B_cm,
+                            uint32_t K_walk, uint32_t N_cols) {
+  uint32_t num_k_tiles = K_walk / TK;
+  uint32_t num_n_tiles = N_cols / TN;
+  B_tiled.resize(K_walk * N_cols);
+  uint32_t offset = 0;
+  for (uint32_t nt = 0; nt < num_n_tiles; ++nt)
+    for (uint32_t kt = 0; kt < num_k_tiles; ++kt)
+      for (uint32_t col = 0; col < TN; ++col)
+        for (uint32_t row = 0; row < TK; ++row)
+          B_tiled[offset++] = B_cm[(nt * TN + col) * K_walk + kt * TK + row];
+}
+
 static void pack_metadata(std::vector<uint32_t>& h_meta,
                           const std::vector<uint8_t>& masks,
                           uint32_t M, uint32_t K) {
@@ -323,6 +339,10 @@ int main(int argc, char* argv[]) {
   std::vector<uint16_t> h_Icol_fp16((size_t)N_gemm * K_gemm);
   for (size_t i = 0; i < h_Icol_fp16.size(); ++i) h_Icol_fp16[i] = f2h_host(h_Icol_fp32[i]);
 
+  // Tile B for cache-friendly sparse fragB loads.
+  std::vector<uint16_t> h_Icol_tiled;
+  tile_B_colmajor(h_Icol_tiled, h_Icol_fp16, K_gemm, N_gemm);
+
   // Device buffers.
   uint32_t wsp_bytes   = (uint32_t)h_W_compressed.size() * sizeof(uint16_t);
   uint32_t wmeta_bytes = (uint32_t)h_meta_W.size() * sizeof(uint32_t);
@@ -346,7 +366,7 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_mem_address(cycles_buffer, &kernel_arg.cycles_addr));
   RT_CHECK(vx_copy_to_dev(Wsp_buffer,    h_W_compressed.data(), 0, wsp_bytes));
   RT_CHECK(vx_copy_to_dev(meta_W_buffer, h_meta_W.data(),       0, wmeta_bytes));
-  RT_CHECK(vx_copy_to_dev(Icol_buffer,   h_Icol_fp16.data(),    0, icol_bytes));
+  RT_CHECK(vx_copy_to_dev(Icol_buffer,   h_Icol_tiled.data(),   0, icol_bytes));
 
   RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_mem_alloc(device, sizeof(kernel_arg_t), VX_MEM_READ_WRITE, &args_buffer));

@@ -70,15 +70,20 @@ static inline void sparse_mma_loop(sp_ctx::input_t* pA_base,
   auto pMetaSp = pMetaBase + tile_row_idx * num_k_tiles * per_k_tile_words;
   auto pTileA = pA_base + tile_row * stride_A;
   constexpr uint32_t a_k_stride = sp_ctx::tileK / 2;
-  auto pTileB = pB_base + tile_col * K_walk;
+  // B is pre-tiled by the host into contiguous tileK×tileN col-major blocks.
+  // Block(n_tile, k_tile) is at offset (n_tile * num_k_tiles + k_tile) * block_elems.
+  // Stride within each block = tileK (not K_walk), giving tight cache reads.
+  constexpr uint32_t block_elems = sp_ctx::tileK * sp_ctx::tileN;
+  uint32_t n_tile = blockIdx.x;
 
   for (int i = 0; i < (int)K_walk; i += (int)sp_ctx::tileK) {
+    uint32_t k_tile = (uint32_t)i / sp_ctx::tileK;
+    auto pTileB = pB_base + (n_tile * num_k_tiles + k_tile) * block_elems;
     sp_ctx::load_matrix_sync<vt::row_major>(fragA, pTileA, stride_A, nullptr, pMetaSp);
-    sp_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, K_walk);
+    sp_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, sp_ctx::tileK);
     sp_ctx::mma_sync(fragC, fragA, fragB, fragC);
     pMetaSp += per_k_tile_words;
     pTileA  += a_k_stride;
-    pTileB  += sp_ctx::tileK;
   }
 
   auto pTileC = pC_base + tile_row * c_stride + tile_col;
