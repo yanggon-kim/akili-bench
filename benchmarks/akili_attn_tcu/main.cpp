@@ -111,6 +111,7 @@ vx_buffer_h S_buffer      = nullptr;
 vx_buffer_h P_fp32_buffer = nullptr;
 vx_buffer_h O_buffer      = nullptr;
 vx_buffer_h cycles_buffer = nullptr;
+vx_buffer_h instrs_buffer = nullptr;
 vx_buffer_h krnl_buffer = nullptr;
 vx_buffer_h args_buffer = nullptr;
 kernel_arg_t kernel_arg = {};
@@ -143,6 +144,7 @@ void cleanup() {
     if (P_fp32_buffer) vx_mem_free(P_fp32_buffer);
     if (O_buffer)      vx_mem_free(O_buffer);
     if (cycles_buffer) vx_mem_free(cycles_buffer);
+    if (instrs_buffer) vx_mem_free(instrs_buffer);
     if (krnl_buffer)   vx_mem_free(krnl_buffer);
     if (args_buffer)   vx_mem_free(args_buffer);
     vx_dev_close(device);
@@ -155,6 +157,13 @@ static void read_back_cycles(const char* stage_tag, uint32_t num_blocks) {
   uint32_t max_cyc = 0;
   for (auto c : h_cycles) if (c > max_cyc) max_cyc = c;
   printf("KCYC[%s,nt=%u]: %u\n", stage_tag, (unsigned)NUM_THREADS, max_cyc);
+}
+static void read_back_instrs(const char* stage_tag, uint32_t num_blocks) {
+  std::vector<uint32_t> h_instrs(num_blocks, 0);
+  vx_copy_from_dev(h_instrs.data(), instrs_buffer, 0, num_blocks * sizeof(uint32_t));
+  uint32_t max_ins = 0;
+  for (auto i : h_instrs) if (i > max_ins) max_ins = i;
+  printf("KINS[%s,nt=%u]: %u\n", stage_tag, (unsigned)NUM_THREADS, max_ins);
 }
 
 int main(int argc, char* argv[]) {
@@ -250,6 +259,9 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_mem_alloc(device, max_blocks * sizeof(uint32_t),
                         VX_MEM_READ_WRITE, &cycles_buffer));
   RT_CHECK(vx_mem_address(cycles_buffer, &kernel_arg.cycles_addr));
+  RT_CHECK(vx_mem_alloc(device, max_blocks * sizeof(uint32_t),
+                        VX_MEM_READ_WRITE, &instrs_buffer));
+  RT_CHECK(vx_mem_address(instrs_buffer, &kernel_arg.instrs_addr));
 
   int errors = 0;
   const float atol = 2e-2f;
@@ -266,7 +278,7 @@ int main(int argc, char* argv[]) {
     RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, 0));
   }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("QK", qk_blocks);
+  read_back_cycles("QK", qk_blocks); read_back_instrs("QK", qk_blocks);
 
   std::vector<float> h_S(N * N, 0.0f);
   RT_CHECK(vx_copy_from_dev(h_S.data(), S_buffer, 0, s_fp32_bytes));
@@ -301,7 +313,7 @@ int main(int argc, char* argv[]) {
     RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
   }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("SM", sm_blocks);
+  read_back_cycles("SM", sm_blocks); read_back_instrs("SM", sm_blocks);
 
   std::vector<float> h_P(N * N);
   RT_CHECK(vx_copy_from_dev(h_P.data(), P_fp32_buffer, 0, s_fp32_bytes));
@@ -335,7 +347,7 @@ int main(int argc, char* argv[]) {
     RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, 0));
   }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("PV", pv_blocks);
+  read_back_cycles("PV", pv_blocks); read_back_instrs("PV", pv_blocks);
 
   std::vector<float> h_O(N * d);
   RT_CHECK(vx_copy_from_dev(h_O.data(), O_buffer, 0, out_bytes));

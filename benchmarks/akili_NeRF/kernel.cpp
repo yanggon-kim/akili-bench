@@ -3,6 +3,15 @@
 #include <math.h>
 #include "common.h"
 
+
+static inline float fast_exp(float x) {
+  x = x < -80.0f ? -80.0f : x;
+  float u = x * 0.03125f;
+  float y = 1.0f + u*(1.0f + u*(0.5f + u*(0.166666667f + u*(0.041666667f + u*0.008333333f))));
+  y = y*y; y = y*y; y = y*y; y = y*y; y = y*y;
+  return y;
+}
+
 // =============================================================================
 // akili_NeRF — SIMT full-NeRF forward pass on the KMU launch API.
 //
@@ -137,10 +146,10 @@ static inline void mlp_fwd_body(kernel_arg_t* arg) {
     o3 += hv * W3[k * MLP_OUT_DIM + 3];
   }
 
-  sigmas[tid]             = logf(1.0f + expf(o0));
-  rgbs[tid * 3 + 0]       = 1.0f / (1.0f + expf(-o1));
-  rgbs[tid * 3 + 1]       = 1.0f / (1.0f + expf(-o2));
-  rgbs[tid * 3 + 2]       = 1.0f / (1.0f + expf(-o3));
+  sigmas[tid]             = logf(1.0f + fast_exp(o0));
+  rgbs[tid * 3 + 0]       = 1.0f / (1.0f + fast_exp(-o1));
+  rgbs[tid * 3 + 1]       = 1.0f / (1.0f + fast_exp(-o2));
+  rgbs[tid * 3 + 2]       = 1.0f / (1.0f + fast_exp(-o3));
 }
 
 static inline void composite_body(kernel_arg_t* arg) {
@@ -160,7 +169,7 @@ static inline void composite_body(kernel_arg_t* arg) {
   for (uint32_t s = 0; s < S; ++s) {
     float sigma = sigmas[base + s];
     float delta = deltas[base + s];
-    float alpha = 1.0f - expf(-sigma * delta);
+    float alpha = 1.0f - fast_exp(-sigma * delta);
     float w = alpha * T;
     R += w * rgbs[(base + s) * 3 + 0];
     G += w * rgbs[(base + s) * 3 + 1];

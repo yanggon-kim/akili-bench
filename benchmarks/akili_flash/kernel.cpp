@@ -5,6 +5,15 @@
 #include <cstring>
 #include "common.h"
 
+
+static inline float fast_exp(float x) {
+  x = x < -80.0f ? -80.0f : x;
+  float u = x * 0.03125f;
+  float y = 1.0f + u*(1.0f + u*(0.5f + u*(0.166666667f + u*(0.041666667f + u*0.008333333f))));
+  y = y*y; y = y*y; y = y*y; y = y*y; y = y*y;
+  return y;
+}
+
 // =============================================================================
 // akili_flash — SIMT FlashAttention on the KMU launch API.
 // Two code paths share one binary, dispatched via arg->kernel_id:
@@ -70,15 +79,15 @@ static inline void flash_kernel_body(kernel_arg_t* arg) {
       rowmax = (sp_buf[k] > rowmax ? sp_buf[k] : rowmax);
 
     for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k)
-      sp_buf[k] = expf(sp_buf[k] - rowmax);
+      sp_buf[k] = fast_exp(sp_buf[k] - rowmax);
 
     float rowsum = 0.0f;
     for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k) rowsum += sp_buf[k];
 
     float new_m = (m > rowmax ? m : rowmax);
-    float new_l = expf(m - new_m) * l + expf(rowmax - new_m) * rowsum;
-    float old_weight = expf(m - new_m);
-    float new_weight = expf(rowmax - new_m);
+    float new_l = fast_exp(m - new_m) * l + fast_exp(rowmax - new_m) * rowsum;
+    float old_weight = fast_exp(m - new_m);
+    float new_weight = fast_exp(rowmax - new_m);
 
     for (uint32_t k = 0; k < HEAD_DIM; ++k) {
       float dot = 0.0f;
@@ -134,7 +143,7 @@ static inline void flash_softmax_body(kernel_arg_t* arg) {
     float local_P[512];
     float exp_sum = 0;
     for (uint32_t col = 0; col < N; ++col) {
-      float e = expf(S[row * N + col] - max_val);
+      float e = fast_exp(S[row * N + col] - max_val);
       local_P[col] = e;
       exp_sum += e;
     }

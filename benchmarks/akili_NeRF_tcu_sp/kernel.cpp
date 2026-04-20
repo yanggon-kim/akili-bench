@@ -4,6 +4,15 @@
 #include <math.h>
 #include "common.h"
 
+
+static inline float fast_exp(float x) {
+  x = x < -80.0f ? -80.0f : x;
+  float u = x * 0.03125f;
+  float y = 1.0f + u*(1.0f + u*(0.5f + u*(0.166666667f + u*(0.041666667f + u*0.008333333f))));
+  y = y*y; y = y*y; y = y*y; y = y*y; y = y*y;
+  return y;
+}
+
 // =============================================================================
 // akili_NeRF_tcu_sp — Full NeRF forward pass with the MLP GEMMs on the SPARSE
 // (2:4) tensor core. KMU launch API.
@@ -171,10 +180,10 @@ static inline void mlp_out_act_body(kernel_arg_t* arg) {
   float r  = pY_fp32[1 * n_pts + tid] + pB[1];
   float g  = pY_fp32[2 * n_pts + tid] + pB[2];
   float b  = pY_fp32[3 * n_pts + tid] + pB[3];
-  pSig[tid]        = logf(1.0f + expf(s));
-  pRGB[tid*3 + 0]  = 1.0f / (1.0f + expf(-r));
-  pRGB[tid*3 + 1]  = 1.0f / (1.0f + expf(-g));
-  pRGB[tid*3 + 2]  = 1.0f / (1.0f + expf(-b));
+  pSig[tid]        = logf(1.0f + fast_exp(s));
+  pRGB[tid*3 + 0]  = 1.0f / (1.0f + fast_exp(-r));
+  pRGB[tid*3 + 1]  = 1.0f / (1.0f + fast_exp(-g));
+  pRGB[tid*3 + 2]  = 1.0f / (1.0f + fast_exp(-b));
 }
 
 static inline void composite_body(kernel_arg_t* arg) {
@@ -194,7 +203,7 @@ static inline void composite_body(kernel_arg_t* arg) {
   for (uint32_t s = 0; s < S; ++s) {
     float sigma = sigmas[base + s];
     float delta = deltas[base + s];
-    float alpha = 1.0f - expf(-sigma * delta);
+    float alpha = 1.0f - fast_exp(-sigma * delta);
     float w = alpha * T;
     R += w * rgbs[(base + s) * 3 + 0];
     G += w * rgbs[(base + s) * 3 + 1];

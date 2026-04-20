@@ -25,6 +25,16 @@ constexpr uint32_t kDescB_QK    = 1;
 constexpr uint32_t kDescA_PV    = 2;
 constexpr uint32_t kDescB_PV    = 3;
 
+// Fast fp32 exp: Taylor(x/32) then y^32. Branchless. Avoids libm expf's
+// softfloat-double fallback on rv32if.
+static inline float fast_exp(float x) {
+  x = x < -80.0f ? -80.0f : x;
+  float u = x * 0.03125f;
+  float y = 1.0f + u*(1.0f + u*(0.5f + u*(0.166666667f + u*(0.041666667f + u*0.008333333f))));
+  y = y*y; y = y*y; y = y*y; y = y*y; y = y*y;
+  return y;
+}
+
 // =============================================================================
 // Stage 2: SIMT softmax on fp32 S. No DXA, no smem.
 // =============================================================================
@@ -51,7 +61,7 @@ static void softmax_body(kernel_arg_t* __UNIFORM__ arg) {
     float local_P[512];
     float exp_sum = 0;
     for (uint32_t col = 0; col < N; ++col) {
-      float e = std::exp(S[row * N + col] - max_val);
+      float e = fast_exp(S[row * N + col] - max_val);
       local_P[col] = e;
       exp_sum += e;
     }
@@ -61,18 +71,19 @@ static void softmax_body(kernel_arg_t* __UNIFORM__ arg) {
 }
 
 // =============================================================================
-// Shared DXA-staged sparse GEMM helper.
-//   A is compressed [M × K/2] row-major, B is col-major (K_walk), Meta is
-//   the packed 2:4 metadata per (tile_row, k_tile) in uint32 words.
-//   A_desc / B_desc / Meta_desc select the DXA descriptor slots for this stage.
+// DXA-staged sparse GEMM bodies, inlined directly in kernel_main (mirrors the
+// sgemm_tcu_sp_smem_dxa style). The previous static-function wrapper forced
+// the compiler to pass A_desc/B_desc as register args and emit a jal/ret; at
+// NT=8/32 the sparse path pays this extra call overhead per K-iter because
+// the sparse mma_sync already spills more registers than dense.
 // =============================================================================
-static inline void sparse_mma_dxa(ctx::input_t*  pA_unused,
-                                  ctx::input_t*  pB_unused,
-                                  ctx::output_t* pC_base,
-                                  const float*   pMeta_base,
-                                  uint32_t K_walk, uint32_t c_stride,
-                                  uint32_t A_desc, uint32_t B_desc) {
-  (void)pA_unused; (void)pB_unused;
+static void qk_sparse_body(kernel_arg_t* __UNIFORM__ arg) {
+  // Task 8 HYBRID: DXA for B (K tile) only; inline gmem load for A (Q compressed) + meta.
+  auto pA_base = reinterpret_cast<ctx::input_t*>(arg->Q_addr);
+  auto pC_base = reinterpret_cast<ctx::output_t*>(arg->S_addr);
+  auto pMeta_base = reinterpret_cast<const float*>(arg->meta_Q_addr);
+  uint32_t K_walk = arg->d;
+  uint32_t c_stride = arg->N;
 
   ctx::fragment_a   fragA;
   ctx::fragment_b   fragB;
@@ -82,7 +93,6 @@ static inline void sparse_mma_dxa(ctx::input_t*  pA_unused,
   uint32_t tile_col = blockIdx.x * ctx::tileN;
   ctx::fill_fragment(fragC, 0);
 
-  // Meta sizing — matches host pack_metadata.
   constexpr uint32_t rtl_i_ratio = 32 / vt::fp16::bits;
   constexpr uint32_t meta_cols = (NUM_TCU_LANES * 2 * rtl_i_ratio + 31) / 32;
   using kcfg = vt::wmma_config_t<NUM_TCU_LANES>;
@@ -90,33 +100,28 @@ static inline void sparse_mma_dxa(ctx::input_t*  pA_unused,
   constexpr uint32_t num_meta_loads = (PD * meta_cols + NUM_TCU_LANES - 1) / NUM_TCU_LANES;
   constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_TCU_LANES;
 
-  constexpr uint32_t stride_A_smem = ctx::tileK / 2;
+  // SMEM: B tile only.
+  auto B_smem = reinterpret_cast<ctx::input_t*>(__local_mem());
 
-  // Option B: smem layout is just [A tile][B tile] — Meta stays in DDR.
-  auto smem   = reinterpret_cast<ctx::input_t*>(__local_mem());
-  auto A_smem = smem;
-  auto B_smem = smem + ctx::tileM * stride_A_smem;
+  uint32_t stride_A = K_walk / 2;   // compressed-A row stride in gmem
+  auto tileA    = pA_base + tile_row * stride_A;
+  uint32_t num_k_tiles = K_walk / ctx::tileK;
+  auto tileMeta = pMeta_base + blockIdx.y * num_k_tiles * per_k_tile_words;
 
   vortex::barrier bar(0);
   const bool is_dxa_warp = (csr_read(VX_CSR_CTA_RANK) == 0);
 
-  // Option B: per-CTA DDR Meta pointer — walks per k-tile, matching WMMA ref.
-  uint32_t num_k_tiles = K_walk / ctx::tileK;
-  (void)num_k_tiles;
-  auto pMetaDDR = pMeta_base + blockIdx.y * num_k_tiles * per_k_tile_words;
-
   for (uint32_t i = 0; i < K_walk; i += ctx::tileK) {
     if (is_dxa_warp) {
-      vx_dxa_issue_2d_wg(A_desc, bar.id(), A_smem, i / 2, tile_row);
-      vx_dxa_issue_2d_wg(B_desc, bar.id(), B_smem, i,     tile_col);
+      vx_dxa_issue_2d_wg(kDescB_QK, bar.id(), B_smem, i, tile_col);
     }
     bar.arrive_and_wait();
-
-    ctx::load_matrix_sync<vt::row_major>(fragA, A_smem, stride_A_smem, nullptr, pMetaDDR);
+    // A + meta direct from gmem (non-DXA pattern).
+    ctx::load_matrix_sync<vt::row_major>(fragA, tileA, stride_A, nullptr, tileMeta);
     ctx::load_matrix_sync<vt::col_major>(fragB, B_smem, ctx::tileK);
     ctx::mma_sync(fragC, fragA, fragB, fragC);
-
-    pMetaDDR += per_k_tile_words;
+    tileA    += ctx::tileK / 2;
+    tileMeta += per_k_tile_words;
     bar.arrive_and_wait();
   }
 
@@ -124,28 +129,54 @@ static inline void sparse_mma_dxa(ctx::input_t*  pA_unused,
   ctx::store_matrix_sync(pTileC, fragC, c_stride);
 }
 
-// =============================================================================
-// Stage 1: sparse TCU S = Q·Kᵀ   (K_walk = d_attn)
-// =============================================================================
-static void qk_sparse_body(kernel_arg_t* __UNIFORM__ arg) {
-  auto pA = reinterpret_cast<ctx::input_t*>(arg->Q_addr);
-  auto pB = reinterpret_cast<ctx::input_t*>(arg->K_addr);
-  auto pC = reinterpret_cast<ctx::output_t*>(arg->S_addr);
-  auto pM = reinterpret_cast<const float*>(arg->meta_Q_addr);
-  sparse_mma_dxa(pA, pB, pC, pM, arg->d, arg->N,
-                 kDescA_QK, kDescB_QK);
-}
-
-// =============================================================================
-// Stage 3: sparse TCU O = P·V   (K_walk = N_attn)
-// =============================================================================
 static void pv_sparse_body(kernel_arg_t* __UNIFORM__ arg) {
-  auto pA = reinterpret_cast<ctx::input_t*>(arg->P_addr);
-  auto pB = reinterpret_cast<ctx::input_t*>(arg->V_addr);
-  auto pC = reinterpret_cast<ctx::output_t*>(arg->O_addr);
-  auto pM = reinterpret_cast<const float*>(arg->meta_P_addr);
-  sparse_mma_dxa(pA, pB, pC, pM, arg->N, arg->d,
-                 kDescA_PV, kDescB_PV);
+  // Task 8 HYBRID: DXA for B (V tile) only; inline gmem load for A (P compressed) + meta.
+  auto pA_base = reinterpret_cast<ctx::input_t*>(arg->P_addr);
+  auto pC_base = reinterpret_cast<ctx::output_t*>(arg->O_addr);
+  auto pMeta_base = reinterpret_cast<const float*>(arg->meta_P_addr);
+  uint32_t K_walk = arg->N;
+  uint32_t c_stride = arg->d;
+
+  ctx::fragment_a   fragA;
+  ctx::fragment_b   fragB;
+  ctx::fragment_acc fragC;
+
+  uint32_t tile_row = blockIdx.y * ctx::tileM;
+  uint32_t tile_col = blockIdx.x * ctx::tileN;
+  ctx::fill_fragment(fragC, 0);
+
+  constexpr uint32_t rtl_i_ratio = 32 / vt::fp16::bits;
+  constexpr uint32_t meta_cols = (NUM_TCU_LANES * 2 * rtl_i_ratio + 31) / 32;
+  using kcfg = vt::wmma_config_t<NUM_TCU_LANES>;
+  constexpr uint32_t PD = kcfg::m_steps * (kcfg::k_steps / 2);
+  constexpr uint32_t num_meta_loads = (PD * meta_cols + NUM_TCU_LANES - 1) / NUM_TCU_LANES;
+  constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_TCU_LANES;
+
+  auto B_smem = reinterpret_cast<ctx::input_t*>(__local_mem());
+
+  uint32_t stride_A = K_walk / 2;   // compressed-A row stride in gmem
+  auto tileA    = pA_base + tile_row * stride_A;
+  uint32_t num_k_tiles = K_walk / ctx::tileK;
+  auto tileMeta = pMeta_base + blockIdx.y * num_k_tiles * per_k_tile_words;
+
+  vortex::barrier bar(0);
+  const bool is_dxa_warp = (csr_read(VX_CSR_CTA_RANK) == 0);
+
+  for (uint32_t i = 0; i < K_walk; i += ctx::tileK) {
+    if (is_dxa_warp) {
+      vx_dxa_issue_2d_wg(kDescB_PV, bar.id(), B_smem, i, tile_col);
+    }
+    bar.arrive_and_wait();
+    ctx::load_matrix_sync<vt::row_major>(fragA, tileA, stride_A, nullptr, tileMeta);
+    ctx::load_matrix_sync<vt::col_major>(fragB, B_smem, ctx::tileK);
+    ctx::mma_sync(fragC, fragA, fragB, fragC);
+    tileA    += ctx::tileK / 2;
+    tileMeta += per_k_tile_words;
+    bar.arrive_and_wait();
+  }
+
+  auto pTileC = pC_base + tile_row * c_stride + tile_col;
+  ctx::store_matrix_sync(pTileC, fragC, c_stride);
 }
 
 // =============================================================================

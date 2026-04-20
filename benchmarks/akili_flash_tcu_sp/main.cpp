@@ -360,8 +360,9 @@ int main(int argc, char* argv[]) {
 
   RT_CHECK(vx_copy_to_dev(Qsp_buffer, h_Q_compressed.data(), 0, qsp_bytes));
   RT_CHECK(vx_copy_to_dev(meta_Q_buf, h_meta_Q.data(),       0, q_meta_bytes));
-  RT_CHECK(vx_copy_to_dev(K_fp16_buf, h_K_tiled.data(),      0, in_fp16_bytes));
-  RT_CHECK(vx_copy_to_dev(V_fp16_buf, h_V_tiled.data(),     0, in_fp16_bytes));
+  // Use plain col-major (sgemm_tcu_sp pattern).
+  RT_CHECK(vx_copy_to_dev(K_fp16_buf, h_K_cm.data(),         0, in_fp16_bytes));
+  RT_CHECK(vx_copy_to_dev(V_fp16_buf, h_V_cm.data(),         0, in_fp16_bytes));
 
   RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_mem_alloc(device, sizeof(kernel_arg_t), VX_MEM_READ_WRITE, &args_buffer));

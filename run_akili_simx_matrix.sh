@@ -16,7 +16,7 @@ DEFAULT_NUM_WARPS=16
 DEFAULT_DCACHE_SIZE=65536
 DEFAULT_DCACHE_NUM_WAYS=8
 DEFAULT_L2_ENABLED=1
-DEFAULT_BENCH_BUILD_LOCK="/tmp/akili_bench_build.lock"
+DEFAULT_BENCH_BUILD_LOCK="/tmp/akili_bench_build_${USER}.lock"
 DEFAULT_TIMEOUT_SECS=1800
 DEFAULT_PROFILE="sanity"
 DEFAULT_THREADS_CSV="4,8,16,32"
@@ -377,17 +377,20 @@ discover_benchmarks() {
 
 benchmark_family() {
   case "$1" in
-    akili_attn|akili_attn_tcu|akili_attn_tcu_sp) printf 'attn\n' ;;
-    akili_flash|akili_flash_tcu|akili_flash_tcu_sp) printf 'flash\n' ;;
-    akili_cnn|akili_acccnn_tcu|akili_acccnn_tcu_sp) printf 'cnn\n' ;;
-    akili_NeRF|akili_NeRF_tcu|akili_NeRF_tcu_sp) printf 'nerf\n' ;;
-    akili_llama2|akili_llama2_tcu|akili_llama2_tcu_sp) printf 'llama\n' ;;
+    akili_attn|akili_attn_tcu|akili_attn_tcu_sp|akili_attn_tcu_dxa|akili_attn_tcu_sp_dxa) printf 'attn\n' ;;
+    akili_flash|akili_flash_tcu|akili_flash_tcu_sp|akili_flash_tcu_dxa|akili_flash_tcu_sp_dxa) printf 'flash\n' ;;
+    akili_cnn|akili_acccnn_tcu|akili_acccnn_tcu_sp|akili_acccnn_tcu_dxa|akili_acccnn_tcu_sp_dxa) printf 'cnn\n' ;;
+    akili_NeRF|akili_NeRF_tcu|akili_NeRF_tcu_sp|akili_NeRF_tcu_dxa|akili_NeRF_tcu_sp_dxa) printf 'nerf\n' ;;
+    akili_llama2|akili_llama2_tcu|akili_llama2_tcu_sp|akili_llama2_tcu_dxa|akili_llama2_tcu_sp_dxa) printf 'llama\n' ;;
+    akili_llama2_prefill|akili_llama2_prefill_tcu|akili_llama2_prefill_tcu_sp|akili_llama2_prefill_tcu_dxa|akili_llama2_prefill_tcu_sp_dxa) printf 'llama_prefill\n' ;;
     *) return 1 ;;
   esac
 }
 
 benchmark_mode() {
   case "$1" in
+    *_tcu_sp_dxa) printf 'tcu_sparse_dxa\n' ;;
+    *_tcu_dxa) printf 'tcu_dxa\n' ;;
     *_tcu_sp) printf 'tcu_sparse\n' ;;
     *_tcu) printf 'tcu\n' ;;
     *) printf 'simt\n' ;;
@@ -458,12 +461,14 @@ resolve_default_opts() {
         return
       fi
       ;;
-    llama)
+    llama|llama_prefill)
       case "$benchmark" in
-        akili_llama2)
+        akili_llama2|akili_llama2_prefill)
           base_llama_opts="data/stories15M.bin -z data/tokenizer.bin"
           ;;
-        akili_llama2_tcu|akili_llama2_tcu_sp)
+        akili_llama2_tcu|akili_llama2_tcu_sp|akili_llama2_tcu_dxa|akili_llama2_tcu_sp_dxa| \
+        akili_llama2_prefill_tcu|akili_llama2_prefill_tcu_sp| \
+        akili_llama2_prefill_tcu_dxa|akili_llama2_prefill_tcu_sp_dxa)
           base_llama_opts="../akili_llama2/data/stories15M.bin -z ../akili_llama2/data/tokenizer.bin"
           ;;
         *)
@@ -489,22 +494,24 @@ resolve_default_opts() {
   fi
 
   case "$benchmark" in
-    akili_attn|akili_attn_tcu|akili_attn_tcu_sp)
+    akili_attn|akili_attn_tcu|akili_attn_tcu_sp|akili_attn_tcu_dxa|akili_attn_tcu_sp_dxa)
       printf '%s\n' '-n 16 -d 16'
       ;;
-    akili_flash|akili_flash_tcu|akili_flash_tcu_sp)
+    akili_flash|akili_flash_tcu|akili_flash_tcu_sp|akili_flash_tcu_dxa|akili_flash_tcu_sp_dxa)
       printf '%s\n' '-n 16 -d 16'
       ;;
-    akili_cnn|akili_acccnn_tcu|akili_acccnn_tcu_sp)
+    akili_cnn|akili_acccnn_tcu|akili_acccnn_tcu_sp|akili_acccnn_tcu_dxa|akili_acccnn_tcu_sp_dxa)
       printf '%s\n' '-c 1 -o 8 -h 28 -w 28 -s 3'
       ;;
-    akili_NeRF|akili_NeRF_tcu|akili_NeRF_tcu_sp)
+    akili_NeRF|akili_NeRF_tcu|akili_NeRF_tcu_sp|akili_NeRF_tcu_dxa|akili_NeRF_tcu_sp_dxa)
       printf '%s\n' '-r 32 -s 8'
       ;;
-    akili_llama2)
+    akili_llama2|akili_llama2_prefill)
       printf '%s\n' "$base_llama_opts -n $TOKENS -t $TEMPERATURE -v 1"
       ;;
-    akili_llama2_tcu|akili_llama2_tcu_sp)
+    akili_llama2_tcu|akili_llama2_tcu_sp|akili_llama2_tcu_dxa|akili_llama2_tcu_sp_dxa| \
+    akili_llama2_prefill_tcu|akili_llama2_prefill_tcu_sp| \
+    akili_llama2_prefill_tcu_dxa|akili_llama2_prefill_tcu_sp_dxa)
       printf '%s\n' "$base_llama_opts -n $TOKENS -t $TEMPERATURE -v 1"
       ;;
     *)
@@ -686,7 +693,7 @@ run_nt_suite() {
     dcache_banks=16
   fi
 
-  build_configs="-DNUM_CORES=$CORES -DNUM_THREADS=$nt -DEXT_TCU_ENABLE -DTCU_SPARSE_ENABLE -DISSUE_WIDTH=$ISSUE_WIDTH -DNUM_LSU_BLOCKS=$NUM_LSU_BLOCKS -DNUM_WARPS=$NUM_WARPS -DPLATFORM_MEMORY_NUM_BANKS=$PLATFORM_MEMORY_BANKS -DDCACHE_SIZE=$DCACHE_SIZE -DDCACHE_NUM_WAYS=$DCACHE_NUM_WAYS -DDCACHE_NUM_BANKS=$dcache_banks -DDCACHE_WRITEBACK=0 -DL2_WRITEBACK=0"
+  build_configs="-DNUM_CORES=$CORES -DNUM_THREADS=$nt -DEXT_TCU_ENABLE -DTCU_SPARSE_ENABLE -DEXT_DXA_ENABLE -DISSUE_WIDTH=$ISSUE_WIDTH -DNUM_LSU_BLOCKS=$NUM_LSU_BLOCKS -DNUM_WARPS=$NUM_WARPS -DPLATFORM_MEMORY_NUM_BANKS=$PLATFORM_MEMORY_BANKS -DDCACHE_SIZE=$DCACHE_SIZE -DDCACHE_NUM_WAYS=$DCACHE_NUM_WAYS -DDCACHE_NUM_BANKS=$dcache_banks -DDCACHE_WRITEBACK=0 -DL2_WRITEBACK=0"
   if (( L2_ENABLED )); then
     build_configs="$(append_build_config "$build_configs" "-DL2_ENABLE")"
     build_configs="$(append_build_config "$build_configs" "-DL2_CACHE_SIZE=$L2_CACHE_SIZE")"
@@ -908,6 +915,21 @@ declare -a SUPPORTED_BENCHMARKS=(
   akili_llama2
   akili_llama2_tcu
   akili_llama2_tcu_sp
+  akili_attn_tcu_dxa
+  akili_attn_tcu_sp_dxa
+  akili_flash_tcu_dxa
+  akili_flash_tcu_sp_dxa
+  akili_acccnn_tcu_dxa
+  akili_acccnn_tcu_sp_dxa
+  akili_NeRF_tcu_dxa
+  akili_NeRF_tcu_sp_dxa
+  akili_llama2_tcu_dxa
+  akili_llama2_tcu_sp_dxa
+  akili_llama2_prefill
+  akili_llama2_prefill_tcu
+  akili_llama2_prefill_tcu_sp
+  akili_llama2_prefill_tcu_dxa
+  akili_llama2_prefill_tcu_sp_dxa
 )
 declare -A BENCHMARK_OPTS=()
 

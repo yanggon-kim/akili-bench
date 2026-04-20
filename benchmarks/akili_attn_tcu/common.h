@@ -19,6 +19,7 @@ typedef struct {
   uint64_t S_addr;   // fp32 intermediate
   uint64_t O_addr;   // fp32 output [N × d]
   uint64_t cycles_addr;  // uint32_t[num_blocks_max]
+  uint64_t instrs_addr;  // uint32_t[num_blocks_max] per-stage retired instructions
   uint32_t N;
   uint32_t d;
   uint32_t kernel_id;

@@ -23,7 +23,14 @@
 #define MLP_W            64
 #define MLP_DEPTH        4
 #define MLP_OUT_DIM      4
-#define MLP_OUT_DIM_PAD  8
+#ifndef NUM_THREADS
+#define NUM_THREADS 8
+#endif
+#if NUM_THREADS >= 16
+#define MLP_OUT_DIM_PAD  16     // padded to tileM = 16 at NT=16/32
+#else
+#define MLP_OUT_DIM_PAD  8      // padded to tileM = 8 at NT<=8
+#endif
 
 typedef struct {
   // ---- Stage 1 (ray setup) I/O ----

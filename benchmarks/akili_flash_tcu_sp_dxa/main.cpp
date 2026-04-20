@@ -363,8 +363,8 @@ int main(int argc, char* argv[]) {
   const float atol = 2e-2f;
   const float rtol = 2e-2f;
 
-  // Option B: LMEM is just A + B (no Meta region).
-  uint32_t gemm_smem_size = (TM * (TK / 2) + TN * TK) * sizeof(uint16_t);
+  // Task 8 HYBRID: LMEM is B tile only (A + meta loaded inline from gmem).
+  uint32_t gemm_smem_size = TN * TK * sizeof(uint16_t);
 
   // ---------------- Stage 1: sparse QK ----------------
   std::cout << "=== Stage 1: S = Q @ K^T (sparse TCU, DXA) ===" << std::endl;

@@ -366,7 +366,10 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_mem_address(cycles_buffer, &kernel_arg.cycles_addr));
   RT_CHECK(vx_copy_to_dev(Wsp_buffer,    h_W_compressed.data(), 0, wsp_bytes));
   RT_CHECK(vx_copy_to_dev(meta_W_buffer, h_meta_W.data(),       0, wmeta_bytes));
-  RT_CHECK(vx_copy_to_dev(Icol_buffer,   h_Icol_tiled.data(),   0, icol_bytes));
+  // sgemm_tcu_sp pattern: plain col-major B (h_Icol_fp16 is already col-major, so
+  // upload it directly instead of the pre-tiled layout).
+  (void)h_Icol_tiled;
+  RT_CHECK(vx_copy_to_dev(Icol_buffer,   h_Icol_fp16.data(),    0, icol_bytes));
 
   RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_mem_alloc(device, sizeof(kernel_arg_t), VX_MEM_READ_WRITE, &args_buffer));

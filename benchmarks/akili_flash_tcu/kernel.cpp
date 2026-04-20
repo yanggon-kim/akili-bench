@@ -8,6 +8,16 @@
 namespace vt = vortex::tensor;
 using tcu_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
 
+// Fast fp32 exp: Taylor(x/32) then y^32. Branchless, fp32-only.
+// Avoids libm expf's softfloat-double fallback on rv32if.
+static inline float fast_exp(float x) {
+  x = x < -80.0f ? -80.0f : x;
+  float u = x * 0.03125f;
+  float y = 1.0f + u*(1.0f + u*(0.5f + u*(0.166666667f + u*(0.041666667f + u*0.008333333f))));
+  y = y*y; y = y*y; y = y*y; y = y*y; y = y*y;
+  return y;
+}
+
 // =============================================================================
 // Stage 2: SIMT softmax on fp32 S. One row per flat thread index.
 // =============================================================================
@@ -30,7 +40,7 @@ static inline void softmax_body(kernel_arg_t* arg) {
     float local_P[512];
     float exp_sum = 0;
     for (uint32_t col = 0; col < N; ++col) {
-      float e = std::exp(S[row * N + col] - max_val);
+      float e = fast_exp(S[row * N + col] - max_val);
       local_P[col] = e;
       exp_sum += e;
     }

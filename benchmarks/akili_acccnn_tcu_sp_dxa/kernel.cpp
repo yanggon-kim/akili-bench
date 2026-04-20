@@ -1,7 +1,11 @@
-// akili_acccnn_tcu_sp_dxa — DXA-staged smem variant of akili_acccnn_tcu_sp.
-// Sparse TCU conv2d (2:4 on W) with compressed A, col-major B, packed meta.
-// A is fp16 [M×K/2], B is fp16 [N×K] (col-major view), Meta is uint32 words.
-// Mirrors sgemm_tcu_sp_smem_dxa.
+// akili_acccnn_tcu_sp_dxa — Task 10 HYBRID variant:
+// Use DXA only for matrix B (SMEM-staged). Load compressed-A + meta directly
+// from gmem via inline load_matrix_sync (same pattern as non-DXA sparse kernel).
+//
+//   W compressed row-major [M × K/2]  — inline gmem load (LSU → DCache/L2)
+//   B col-major   [N × K]             — DXA-staged into SMEM
+//   Meta (packed uint32)              — inline gmem load via pMetaDDR
+//   O dense  row-major [M × N]
 
 #include <vx_spawn2.h>
 #include <vx_tensor.h>
@@ -13,12 +17,12 @@
 namespace vt = vortex::tensor;
 using ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
 
-constexpr uint32_t kDescA    = 0;  // compressed A
-constexpr uint32_t kDescB    = 1;
-// Option B: no kDescMeta — metadata is read directly from DDR via the
-// load_matrix_sync fast-path, not staged through LMEM.
+// Only kDescB is used in the hybrid variant; kDescA and kDescMeta are unused.
+constexpr uint32_t kDescA    = 0;  // unused in hybrid
+constexpr uint32_t kDescB    = 1;  // col-major B (only DXA descriptor we use)
 
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
+  auto pA = reinterpret_cast<ctx::input_t*>(arg->W_addr);
   auto pC = reinterpret_cast<ctx::output_t*>(arg->O_addr);
 
   uint32_t N = arg->N_gemm;
@@ -40,33 +44,33 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   constexpr uint32_t num_meta_loads = (PD * meta_cols + NUM_TCU_LANES - 1) / NUM_TCU_LANES;
   constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_TCU_LANES;
 
-  constexpr uint32_t stride_A_smem = ctx::tileK / 2;
+  uint32_t num_k_tiles = K / ctx::tileK;
+  uint32_t stride_A = K / 2;
 
-  // smem layout: [A tile (tileM × tileK/2) fp16] [B tile (tileN × tileK) fp16]
-  // Option B: no LMEM region for Meta — it stays in DDR.
-  auto smem   = reinterpret_cast<ctx::input_t*>(__local_mem());
-  auto A_smem = smem;
-  auto B_smem = smem + ctx::tileM * stride_A_smem;
+  // Inline gmem pointers for A and meta (non-DXA pattern).
+  auto tileA    = pA + tile_row * stride_A;
+  auto pMetaDDR = reinterpret_cast<const float*>(arg->meta_W_addr)
+                + blockIdx.y * num_k_tiles * per_k_tile_words;
+
+  // SMEM: only B tile (tileN × tileK fp16, col-major). No A/meta SMEM regions.
+  auto B_smem = reinterpret_cast<ctx::input_t*>(__local_mem());
 
   vortex::barrier bar(0);
   const bool is_dxa_warp = (csr_read(VX_CSR_CTA_RANK) == 0);
 
-  uint32_t num_k_tiles = K / ctx::tileK;
-  // Option B: walk a DDR metadata pointer, matching the WMMA reference.
-  auto pMetaDDR = reinterpret_cast<const float*>(arg->meta_W_addr)
-                + blockIdx.y * num_k_tiles * per_k_tile_words;
-
   for (uint32_t i = 0; i < K; i += ctx::tileK) {
     if (is_dxa_warp) {
-      vx_dxa_issue_2d_wg(kDescA, bar.id(), A_smem, i / 2, tile_row);
-      vx_dxa_issue_2d_wg(kDescB, bar.id(), B_smem, i,     tile_col);
+      vx_dxa_issue_2d_wg(kDescB, bar.id(), B_smem, i, tile_col);
     }
     bar.arrive_and_wait();
 
-    ctx::load_matrix_sync<vt::row_major>(fragA, A_smem, stride_A_smem, nullptr, pMetaDDR);
+    // A + meta loaded directly from gmem (non-DXA pattern).
+    ctx::load_matrix_sync<vt::row_major>(fragA, tileA, stride_A, nullptr, pMetaDDR);
+    // B loaded from SMEM (DXA-staged).
     ctx::load_matrix_sync<vt::col_major>(fragB, B_smem, ctx::tileK);
     ctx::mma_sync(fragC, fragA, fragB, fragC);
 
+    tileA    += ctx::tileK / 2;
     pMetaDDR += per_k_tile_words;
     bar.arrive_and_wait();
   }

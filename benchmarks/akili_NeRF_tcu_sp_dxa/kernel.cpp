@@ -6,9 +6,18 @@
 #include <math.h>
 #include "common.h"
 
-// DXA descriptor slots (programmed by host per MLP layer).
-// Option B: no kDescMeta — metadata stays in DDR.
-constexpr uint32_t kDescA = 0;  // compressed W [N_out x K_in/2] row-major
+
+static inline float fast_exp(float x) {
+  x = x < -80.0f ? -80.0f : x;
+  float u = x * 0.03125f;
+  float y = 1.0f + u*(1.0f + u*(0.5f + u*(0.166666667f + u*(0.041666667f + u*0.008333333f))));
+  y = y*y; y = y*y; y = y*y; y = y*y; y = y*y;
+  return y;
+}
+
+// HYBRID variant: only kDescB is used — W compressed + meta are read inline
+// from gmem via sparse load_matrix_sync (same as non-DXA sparse kernel).
+constexpr uint32_t kDescA = 0;  // unused in hybrid
 constexpr uint32_t kDescB = 1;  // activations X [K_in x n_points] row-major
 
 // =============================================================================
@@ -100,6 +109,7 @@ static inline void ray_setup_body(kernel_arg_t* arg) {
 // Stage 2: SPARSE TCU MLP layer.
 // -----------------------------------------------------------------------------
 static inline void mlp_gemm_body(kernel_arg_t* arg) {
+  auto pW = reinterpret_cast<sp_ctx::input_t*>(arg->W_cur_addr);
   auto pC = reinterpret_cast<sp_ctx::output_t*>(arg->Y_cur_addr);
 
   uint32_t K_in  = arg->K_in_cur;
@@ -119,35 +129,35 @@ static inline void mlp_gemm_body(kernel_arg_t* arg) {
   constexpr uint32_t PD = kcfg::m_steps * (kcfg::k_steps / 2);
   constexpr uint32_t num_meta_loads = (PD * meta_cols + NUM_TCU_LANES - 1) / NUM_TCU_LANES;
   constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_TCU_LANES;
-  constexpr uint32_t stride_A_smem = sp_ctx::tileK / 2;
 
-  // Option B: SMEM is just [A tile][B tile] — Meta stays in DDR.
-  auto smem   = reinterpret_cast<sp_ctx::input_t*>(__local_mem());
-  auto A_smem = smem;
-  auto B_smem = smem + sp_ctx::tileM * stride_A_smem;
+  uint32_t num_k_tiles = K_in / sp_ctx::tileK;
+  uint32_t stride_A = K_in / 2;
+
+  // Inline gmem pointers for W and meta (non-DXA pattern).
+  auto tileA    = pW + tile_row * stride_A;
+  auto pMetaDDR = reinterpret_cast<const float*>(arg->meta_cur_addr)
+                + blockIdx.y * num_k_tiles * per_k_tile_words;
+
+  // SMEM: only B tile (tileK × tileN fp16). No A/meta SMEM regions.
+  auto B_smem = reinterpret_cast<sp_ctx::input_t*>(__local_mem());
 
   vortex::barrier bar(0);
   const bool is_dxa_warp = (csr_read(VX_CSR_CTA_RANK) == 0);
 
-  // Option B: per-CTA DDR Meta pointer, walks per k-tile.
-  uint32_t num_k_tiles = K_in / sp_ctx::tileK;
-  (void)num_k_tiles;
-  auto pMetaDDR = reinterpret_cast<const float*>(arg->meta_cur_addr)
-                + blockIdx.y * num_k_tiles * per_k_tile_words;
-
   for (uint32_t i = 0; i < K_in; i += sp_ctx::tileK) {
     if (is_dxa_warp) {
-      // A compressed (N_out × K_in/2 row-major): tile at (row=tile_row, col=i/2).
-      vx_dxa_issue_2d_wg(kDescA, bar.id(), A_smem, i / 2,    tile_row);
       // B row-major (K_in × n_points): tile at (row=i, col=tile_col).
       vx_dxa_issue_2d_wg(kDescB, bar.id(), B_smem, tile_col, i);
     }
     bar.arrive_and_wait();
 
-    sp_ctx::load_matrix_sync<vt::row_major>(fragA, A_smem, stride_A_smem, nullptr, pMetaDDR);
+    // W (compressed) + meta loaded directly from gmem (non-DXA pattern).
+    sp_ctx::load_matrix_sync<vt::row_major>(fragA, tileA, stride_A, nullptr, pMetaDDR);
+    // B loaded from SMEM (DXA-staged).
     sp_ctx::load_matrix_sync(fragB, B_smem, sp_ctx::tileN);
     sp_ctx::mma_sync(fragC, fragA, fragB, fragC);
 
+    tileA    += sp_ctx::tileK / 2;
     pMetaDDR += per_k_tile_words;
     bar.arrive_and_wait();
   }
@@ -188,10 +198,10 @@ static inline void mlp_out_act_body(kernel_arg_t* arg) {
   float r  = pY_fp32[1 * n_pts + tid] + pB[1];
   float g  = pY_fp32[2 * n_pts + tid] + pB[2];
   float b  = pY_fp32[3 * n_pts + tid] + pB[3];
-  pSig[tid]        = logf(1.0f + expf(s));
-  pRGB[tid*3 + 0]  = 1.0f / (1.0f + expf(-r));
-  pRGB[tid*3 + 1]  = 1.0f / (1.0f + expf(-g));
-  pRGB[tid*3 + 2]  = 1.0f / (1.0f + expf(-b));
+  pSig[tid]        = logf(1.0f + fast_exp(s));
+  pRGB[tid*3 + 0]  = 1.0f / (1.0f + fast_exp(-r));
+  pRGB[tid*3 + 1]  = 1.0f / (1.0f + fast_exp(-g));
+  pRGB[tid*3 + 2]  = 1.0f / (1.0f + fast_exp(-b));
 }
 
 static inline void composite_body(kernel_arg_t* arg) {
@@ -211,7 +221,7 @@ static inline void composite_body(kernel_arg_t* arg) {
   for (uint32_t s = 0; s < S; ++s) {
     float sigma = sigmas[base + s];
     float delta = deltas[base + s];
-    float alpha = 1.0f - expf(-sigma * delta);
+    float alpha = 1.0f - fast_exp(-sigma * delta);
     float w = alpha * T;
     R += w * rgbs[(base + s) * 3 + 0];
     G += w * rgbs[(base + s) * 3 + 1];

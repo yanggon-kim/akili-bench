@@ -479,12 +479,8 @@ static void run_sparse_matmul(float* C,
 
     uint32_t grid_dim[2] = {padded_N / cfg::tileN, weight->padded_rows / cfg::tileM};
     uint32_t block_dim[2] = {NUM_THREADS, 1};
-    // SMEM: A tile (tileM × tileK/2) fp16 + B tile (tileK × tileN) fp16 +
-    //       Meta prefetch buffer (num_k_tiles × per_k_tile_words uint32).
-    // Fix M1 prefetches all per-CTA metadata to SMEM once at CTA entry.
-    uint32_t num_k_tiles_per_cta = weight->padded_cols / cfg::tileK;
-    uint32_t smem_size = (cfg::tileM * (cfg::tileK / 2) + cfg::tileK * cfg::tileN) * sizeof(itype_t)
-                       + num_k_tiles_per_cta * kPerKTileWords * sizeof(uint32_t);
+    // Task 8 HYBRID: only B tile in SMEM (A + meta loaded inline from gmem).
+    uint32_t smem_size = cfg::tileK * cfg::tileN * sizeof(itype_t);
 
     RT_CHECK(vx_start_g(device, matmul_krnl_buffer, matmul_args_buffer, 2,
                         grid_dim, block_dim, smem_size));

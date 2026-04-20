@@ -202,10 +202,13 @@ vx_buffer_h V_fp16_buf   = nullptr;
 vx_buffer_h S_buffer     = nullptr;
 vx_buffer_h P_fp32_buf   = nullptr;
 vx_buffer_h P_sp_buffer  = nullptr;
+vx_buffer_h P_dense_buf  = nullptr;  // S2: full fp16 P for dense PV
+vx_buffer_h V_dense_buf  = nullptr;  // S2: untiled col-major V for dense PV
 vx_buffer_h O_buffer     = nullptr;
 vx_buffer_h meta_Q_buf   = nullptr;
 vx_buffer_h meta_P_buf   = nullptr;
 vx_buffer_h cycles_buffer = nullptr;
+vx_buffer_h instrs_buffer = nullptr;
 vx_buffer_h krnl_buffer  = nullptr;
 vx_buffer_h args_buffer  = nullptr;
 kernel_arg_t kernel_arg  = {};
@@ -236,10 +239,13 @@ void cleanup() {
     if (S_buffer)    vx_mem_free(S_buffer);
     if (P_fp32_buf)  vx_mem_free(P_fp32_buf);
     if (P_sp_buffer) vx_mem_free(P_sp_buffer);
+    if (P_dense_buf) vx_mem_free(P_dense_buf);
+    if (V_dense_buf) vx_mem_free(V_dense_buf);
     if (O_buffer)    vx_mem_free(O_buffer);
     if (meta_Q_buf)  vx_mem_free(meta_Q_buf);
     if (meta_P_buf)  vx_mem_free(meta_P_buf);
     if (cycles_buffer) vx_mem_free(cycles_buffer);
+    if (instrs_buffer) vx_mem_free(instrs_buffer);
     if (krnl_buffer) vx_mem_free(krnl_buffer);
     if (args_buffer) vx_mem_free(args_buffer);
     vx_dev_close(device);
@@ -252,6 +258,13 @@ static void read_back_cycles(const char* stage_tag, uint32_t num_blocks) {
   uint32_t max_cyc = 0;
   for (auto c : h_cycles) if (c > max_cyc) max_cyc = c;
   printf("KCYC[%s,nt=%u]: %u\n", stage_tag, (unsigned)NUM_THREADS, max_cyc);
+}
+static void read_back_instrs(const char* stage_tag, uint32_t num_blocks) {
+  std::vector<uint32_t> h_instrs(num_blocks, 0);
+  vx_copy_from_dev(h_instrs.data(), instrs_buffer, 0, num_blocks * sizeof(uint32_t));
+  uint32_t max_ins = 0;
+  for (auto i : h_instrs) if (i > max_ins) max_ins = i;
+  printf("KINS[%s,nt=%u]: %u\n", stage_tag, (unsigned)NUM_THREADS, max_ins);
 }
 
 int main(int argc, char* argv[]) {
@@ -346,6 +359,15 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_mem_alloc(device, psp_bytes,      VX_MEM_READ_WRITE, &P_sp_buffer));
   uint64_t P_sp_addr = 0;
   RT_CHECK(vx_mem_address(P_sp_buffer, &P_sp_addr));
+  uint32_t p_dense_bytes = N * N * sizeof(uint16_t);
+  RT_CHECK(vx_mem_alloc(device, p_dense_bytes,  VX_MEM_READ_WRITE, &P_dense_buf));
+  uint64_t P_dense_addr = 0;
+  RT_CHECK(vx_mem_address(P_dense_buf, &P_dense_addr));
+  // S2: untiled col-major V for dense PV
+  RT_CHECK(vx_mem_alloc(device, in_fp16_bytes,  VX_MEM_READ_WRITE, &V_dense_buf));
+  uint64_t V_dense_addr = 0;
+  RT_CHECK(vx_mem_address(V_dense_buf, &V_dense_addr));
+  RT_CHECK(vx_copy_to_dev(V_dense_buf, h_V_cm.data(),            0, in_fp16_bytes));
   RT_CHECK(vx_mem_alloc(device, out_bytes,      VX_MEM_READ_WRITE, &O_buffer));
   RT_CHECK(vx_mem_address(O_buffer, &kernel_arg.O_addr));
   RT_CHECK(vx_mem_alloc(device, q_meta_bytes,   VX_MEM_READ_WRITE, &meta_Q_buf));
@@ -360,8 +382,9 @@ int main(int argc, char* argv[]) {
 
   RT_CHECK(vx_copy_to_dev(Qsp_buffer, h_Q_compressed.data(), 0, qsp_bytes));
   RT_CHECK(vx_copy_to_dev(meta_Q_buf, h_meta_Q.data(),       0, q_meta_bytes));
-  RT_CHECK(vx_copy_to_dev(K_fp16_buf, h_K_tiled.data(),      0, in_fp16_bytes));
-  RT_CHECK(vx_copy_to_dev(V_fp16_buf, h_V_tiled.data(),     0, in_fp16_bytes));
+  // Use plain col-major (sgemm_tcu_sp pattern) — not the pre-tiled layout.
+  RT_CHECK(vx_copy_to_dev(K_fp16_buf, h_K_cm.data(),         0, in_fp16_bytes));
+  RT_CHECK(vx_copy_to_dev(V_fp16_buf, h_V_cm.data(),         0, in_fp16_bytes));
 
   RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_mem_alloc(device, sizeof(kernel_arg_t), VX_MEM_READ_WRITE, &args_buffer));
@@ -375,6 +398,9 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_mem_alloc(device, max_blocks * sizeof(uint32_t),
                         VX_MEM_READ_WRITE, &cycles_buffer));
   RT_CHECK(vx_mem_address(cycles_buffer, &kernel_arg.cycles_addr));
+  RT_CHECK(vx_mem_alloc(device, max_blocks * sizeof(uint32_t),
+                        VX_MEM_READ_WRITE, &instrs_buffer));
+  RT_CHECK(vx_mem_address(instrs_buffer, &kernel_arg.instrs_addr));
 
   int errors = 0;
   const float atol = 2e-2f;
@@ -391,7 +417,7 @@ int main(int argc, char* argv[]) {
     RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, 0));
   }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("QK", qk_blocks);
+  read_back_cycles("QK", qk_blocks); read_back_instrs("QK", qk_blocks);
 
   std::vector<float> h_S(N * N, 0.0f);
   RT_CHECK(vx_copy_from_dev(h_S.data(), S_buffer, 0, s_fp32_bytes));
@@ -425,7 +451,7 @@ int main(int argc, char* argv[]) {
     RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
   }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("SM", sm_blocks);
+  read_back_cycles("SM", sm_blocks); read_back_instrs("SM", sm_blocks);
 
   std::vector<float> h_P(N * N);
   RT_CHECK(vx_copy_from_dev(h_P.data(), P_fp32_buf, 0, s_fp32_bytes));
@@ -444,7 +470,18 @@ int main(int argc, char* argv[]) {
     errors = 0;
   }
 
-  // ---------------- Stage 3: sparse PV ----------------
+  // ---------------- Stage 3: PV ----------------
+#if defined(ATTN_SP_DENSE_PV)
+  // S2: dense PV — skip prune/compress/meta, upload full fp16 P.
+  std::cout << "=== Stage 3: O = P @ V (dense TCU, S2 opt-in) ===" << std::endl;
+  std::vector<uint16_t> h_P_fp16(N * N);
+  for (uint32_t i = 0; i < N * N; ++i) h_P_fp16[i] = f2h_host(h_P[i]);
+  for (uint32_t i = 0; i < N * N; ++i) h_P[i]      = h2f_host(h_P_fp16[i]);
+  RT_CHECK(vx_copy_to_dev(P_dense_buf, h_P_fp16.data(), 0, p_dense_bytes));
+  kernel_arg.P_addr    = P_dense_addr;
+  kernel_arg.V_addr    = V_dense_addr;   // use untiled V for dense PV
+  kernel_arg.kernel_id = KID_PV_DENSE;
+#else
   // Host prunes P 2:4, compresses, packs metadata, uploads.
   std::cout << "=== Stage 3: O = P @ V (sparse TCU) ===" << std::endl;
   std::vector<uint16_t> h_P_fp16(N * N);
@@ -471,13 +508,14 @@ int main(int argc, char* argv[]) {
 
   kernel_arg.P_addr    = P_sp_addr;
   kernel_arg.kernel_id = KID_PV_SPARSE;
+#endif
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
   {
     uint32_t grid_dim[2] = {d / TN, N / TM};
     RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, 0));
   }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-  read_back_cycles("PV", pv_blocks);
+  read_back_cycles("PV", pv_blocks); read_back_instrs("PV", pv_blocks);
 
   std::vector<float> h_O(N * d);
   RT_CHECK(vx_copy_from_dev(h_O.data(), O_buffer, 0, out_bytes));

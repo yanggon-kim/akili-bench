@@ -636,13 +636,10 @@ int main(int argc, char* argv[]) {
     kernel_arg.kernel_id     = KID_MLP_GEMM;
     RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
 
-    // Option B: Program only A + B DXA descriptors. Metadata stays in DDR.
+    // HYBRID: program only kDescB. W (compressed) + meta are read inline
+    // from gmem by the sparse load_matrix_sync fast-path.
     uint32_t num_k_tiles = p.K_in / TK;
     (void)num_k_tiles;
-    RT_CHECK(vx_dxa_program_desc_2d(device, kDescA, p.Wc_addr,
-      /*size0=*/p.K_in / 2, /*size1=*/p.N_out,
-      /*stride0_bytes=*/(p.K_in / 2) * sizeof(uint16_t),
-      /*tile0=*/TK / 2, /*tile1=*/TM, /*elem_bytes=*/sizeof(uint16_t)));
     RT_CHECK(vx_dxa_program_desc_2d(device, kDescB, p.X_addr,
       /*size0=*/n_points, /*size1=*/p.K_in,
       /*stride0_bytes=*/n_points * sizeof(uint16_t),
@@ -650,8 +647,8 @@ int main(int argc, char* argv[]) {
 
     {
       uint32_t grid_dim[2] = {n_points / TN, p.N_out / TM};
-      // Option B: LMEM is just A + B (no Meta region).
-      uint32_t gemm_smem = (TM * (TK / 2) + TK * TN) * sizeof(uint16_t);
+      // HYBRID: LMEM is just the B tile.
+      uint32_t gemm_smem = (TK * TN) * sizeof(uint16_t);
       RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, gemm_smem));
     }
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));

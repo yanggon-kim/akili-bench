@@ -4,6 +4,15 @@
 #include <cmath>
 #include <algorithm>
 
+
+static inline float fast_exp(float x) {
+  x = x < -80.0f ? -80.0f : x;
+  float u = x * 0.03125f;
+  float y = 1.0f + u*(1.0f + u*(0.5f + u*(0.166666667f + u*(0.041666667f + u*0.008333333f))));
+  y = y*y; y = y*y; y = y*y; y = y*y; y = y*y;
+  return y;
+}
+
 // =============================================================================
 // akili_attn — SIMT attention (KMU launch API).
 //   kernel0_body  : S[i,j] = sum_k Q[i,k] * K[k,j]      — 2D grid (col, row)
@@ -45,7 +54,7 @@ static inline void kernel1_body(kernel_arg_t* arg) {
     TYPE local_P[512];
     TYPE exp_sum = 0;
     for (uint32_t col = 0; col < N; ++col) {
-      auto e = std::exp(S[row * N + col] - max_val);
+      auto e = fast_exp(S[row * N + col] - max_val);
       local_P[col] = e;
       exp_sum += e;
     }

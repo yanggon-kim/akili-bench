@@ -8,6 +8,18 @@
 namespace vt = vortex::tensor;
 using tcu_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
 
+// Fast fp32 exp: avoids libm expf's softfloat-double fallback on rv32if.
+// Branchless: clamp x to [-80, 0-ish], Taylor around u = x/32 (converges fast),
+// then square 5 times to get exp(x). Pure fp32, no union/bitcast, no branches
+// (beyond one fminf/fmaxf) — safe for Vortex's divergent-aware codegen.
+static inline float fast_exp(float x) {
+  x = x < -80.0f ? -80.0f : x;
+  float u = x * 0.03125f;  // x / 32
+  float y = 1.0f + u*(1.0f + u*(0.5f + u*(0.166666667f + u*(0.041666667f + u*0.008333333f))));
+  y = y*y; y = y*y; y = y*y; y = y*y; y = y*y;  // y^32
+  return y;
+}
+
 // =============================================================================
 // Stage 2: SIMT softmax on fp32 S. One row per flat thread index.
 // =============================================================================
@@ -30,7 +42,7 @@ static inline void softmax_body(kernel_arg_t* arg) {
     float local_P[512];
     float exp_sum = 0;
     for (uint32_t col = 0; col < N; ++col) {
-      float e = std::exp(S[row * N + col] - max_val);
+      float e = fast_exp(S[row * N + col] - max_val);
       local_P[col] = e;
       exp_sum += e;
     }
@@ -104,6 +116,7 @@ static inline void pv_tcu_body(kernel_arg_t* arg) {
 // =============================================================================
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   __rdcycle_time t0 = vx_rdcycle_sync_begin();
+  uint32_t i0 = csr_read(VX_CSR_MINSTRET);
 
   switch (arg->kernel_id) {
     case KID_QK_TCU:  qk_tcu_body(arg);  break;
@@ -112,10 +125,13 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
     default: break;
   }
 
+  uint32_t i1 = csr_read(VX_CSR_MINSTRET);
   __rdcycle_time t1 = vx_rdcycle_sync_end();
   if (threadIdx.x == 0) {
     auto pCycles = reinterpret_cast<uint32_t*>(arg->cycles_addr);
+    auto pInstrs = reinterpret_cast<uint32_t*>(arg->instrs_addr);
     uint32_t block_id = blockIdx.y * gridDim.x + blockIdx.x;
     pCycles[block_id] = (uint32_t)vx_rdcycle_sync_diff(t0, t1);
+    pInstrs[block_id] = i1 - i0;
   }
 }
