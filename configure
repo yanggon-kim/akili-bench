@@ -57,16 +57,24 @@ if [ -z "$VORTEX_BUILD" ]; then
     VORTEX_BUILD="$VORTEX_HOME/build"
 fi
 
-# Check required Vortex source directories
-for dir in kernel hw; do
+# Check required Vortex source directories and build artifacts. Current
+# Vortex trees keep kernel/runtime under sw/ (used by the e2e_* benchmarks via
+# common/common_vx2.mk); older trees have them at the top level.
+if [ -d "$VORTEX_HOME/sw/kernel" ]; then
+    SRC_DIRS="sw/kernel hw"
+    ARTIFACTS="sw/runtime/libvortex.so sw/kernel/libvortex.a"
+else
+    SRC_DIRS="kernel hw"
+    ARTIFACTS="runtime/libvortex.so kernel/libvortex.a"
+fi
+for dir in $SRC_DIRS; do
     if [ ! -d "$VORTEX_HOME/$dir" ]; then
         echo "Error: $VORTEX_HOME/$dir not found. Is this a Vortex source tree?"
         exit 1
     fi
 done
 
-# Check required Vortex build artifacts
-for artifact in runtime/libvortex.so kernel/libvortex.a; do
+for artifact in $ARTIFACTS; do
     if [ ! -f "$VORTEX_BUILD/$artifact" ]; then
         echo "Error: $VORTEX_BUILD/$artifact not found. Is Vortex built?"
         exit 1

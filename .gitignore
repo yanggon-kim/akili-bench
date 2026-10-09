@@ -28,3 +28,10 @@ ramulator.stats.log
 *.swo
 *~
 .DS_Store
+benchmarks/e2e_flash_attn/e2e_flash_attn
+benchmarks/e2e_conv3x3/e2e_conv3x3
+benchmarks/e2e_nerf/e2e_nerf
+benchmarks/e2e_moe/e2e_moe
+benchmarks/e2e_llama/e2e_llama
+benchmarks/e2e_gemm/e2e_gemm
+config.stamp
