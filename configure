@@ -52,13 +52,18 @@ if [ ! -d "$VORTEX_HOME" ]; then
     exit 1
 fi
 
-# Default build dir to VORTEX_HOME/build
+# Vortex moved to an in-tree build: runtime/kernel source, headers, and
+# compiled libs all live under $(VORTEX_HOME)/sw/{runtime,kernel} directly
+# -- there is no separate out-of-tree build directory for them anymore
+# (only hw/ sim artifacts, like librtlsim.so, still build out-of-tree).
+# Default build dir to VORTEX_HOME/sw so $VORTEX_BUILD/runtime and
+# $VORTEX_BUILD/kernel resolve correctly below.
 if [ -z "$VORTEX_BUILD" ]; then
-    VORTEX_BUILD="$VORTEX_HOME/build"
+    VORTEX_BUILD="$VORTEX_HOME/sw"
 fi
 
 # Check required Vortex source directories
-for dir in kernel hw; do
+for dir in sw hw; do
     if [ ! -d "$VORTEX_HOME/$dir" ]; then
         echo "Error: $VORTEX_HOME/$dir not found. Is this a Vortex source tree?"
         exit 1

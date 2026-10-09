@@ -23,13 +23,15 @@
 #define PE_L             4
 #define MLP_IN_DIM       27
 #define MLP_IN_DIM_PAD   32     // must be multiple of tileK = 16 (dense)
-#define MLP_W            64     // hidden width, multiple of tileM=tileN=8
+#define MLP_W            256
 #define MLP_DEPTH        4
 #define MLP_OUT_DIM      4
-#ifndef NUM_THREADS
-#define NUM_THREADS 8
+#ifndef VX_CFG_NUM_THREADS
+#define VX_CFG_NUM_THREADS 8
 #endif
-#if NUM_THREADS >= 16
+#ifdef VX_CFG_TCU_WGMMA_ENABLE
+#define MLP_OUT_DIM_PAD  64     // one 8-warp WGMMA CTA (cta_M = 8 * xtileM)
+#elif VX_CFG_NUM_THREADS >= 16
 #define MLP_OUT_DIM_PAD  16     // padded to tileM = 16 at NT=16/32
 #else
 #define MLP_OUT_DIM_PAD  8      // padded to tileM = 8 at NT<=8

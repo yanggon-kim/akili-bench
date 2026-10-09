@@ -13,6 +13,34 @@ static inline float fast_exp(float x) {
   return y;
 }
 
+// Polynomial sin/cos/log for the SIMT stages. libm sinf/cosf hang
+// non-deterministically on this core at >= ~2k points (reproduced on SimX),
+// so the positional encoding and softplus avoid libm entirely.
+static inline float fast_sin(float x) {
+  const float kTwoPi = 6.28318530718f, kPi = 3.14159265359f, kHalfPi = 1.57079632679f;
+  float q = x * (1.0f / kTwoPi);
+  int n = (int)(q + (q >= 0.0f ? 0.5f : -0.5f));
+  x -= (float)n * kTwoPi;                  // [-pi, pi]
+  if (x > kHalfPi) x = kPi - x;            // fold to [-pi/2, pi/2]
+  else if (x < -kHalfPi) x = -kPi - x;
+  float x2 = x * x;
+  return x * (1.0f + x2 * (-1.0f / 6.0f + x2 * (1.0f / 120.0f
+           + x2 * (-1.0f / 5040.0f + x2 * (1.0f / 362880.0f)))));
+}
+static inline float fast_cos(float x) { return fast_sin(x + 1.57079632679f); }
+
+// log(x) for x >= 1 (softplus argument): exponent from the float bits plus an
+// atanh series on the mantissa in [1, 2).
+static inline float fast_log(float x) {
+  if (!(x < 3.0e38f)) return x;
+  union { float f; uint32_t u; } v = { x };
+  int e = (int)((v.u >> 23) & 0xff) - 127;
+  v.u = (v.u & 0x007fffffu) | 0x3f800000u;
+  float z = (v.f - 1.0f) / (v.f + 1.0f), z2 = z * z;
+  float lm = 2.0f * z * (1.0f + z2 * (1.0f / 3.0f + z2 * (1.0f / 5.0f + z2 * (1.0f / 7.0f + z2 * (1.0f / 9.0f)))));
+  return (float)e * 0.69314718056f + lm;
+}
+
 // =============================================================================
 // akili_NeRF_tcu — Full NeRF forward pass with TCU-accelerated MLP on the KMU
 // launch API. One __kernel entry point dispatches 5 stages via arg->kernel_id.
@@ -25,7 +53,7 @@ static inline float fast_exp(float x) {
 // =============================================================================
 
 namespace vt = vortex::tensor;
-using tcu_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
+using tcu_ctx = vt::wmma_context<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
 
 // fp32 -> fp16 (IEEE) packing helper.
 static inline uint16_t d_f2h(float x) {
@@ -93,12 +121,12 @@ static inline void ray_setup_body(kernel_arg_t* arg) {
   float freq = 1.0f;
   for (int L = 0; L < PE_L; ++L) {
     uint32_t base = 3 + L*6;
-    pe_out[(base+0) * n_pts + pt] = d_f2h(sinf(freq * px));
-    pe_out[(base+1) * n_pts + pt] = d_f2h(cosf(freq * px));
-    pe_out[(base+2) * n_pts + pt] = d_f2h(sinf(freq * py));
-    pe_out[(base+3) * n_pts + pt] = d_f2h(cosf(freq * py));
-    pe_out[(base+4) * n_pts + pt] = d_f2h(sinf(freq * pz));
-    pe_out[(base+5) * n_pts + pt] = d_f2h(cosf(freq * pz));
+    pe_out[(base+0) * n_pts + pt] = d_f2h(fast_sin(freq * px));
+    pe_out[(base+1) * n_pts + pt] = d_f2h(fast_cos(freq * px));
+    pe_out[(base+2) * n_pts + pt] = d_f2h(fast_sin(freq * py));
+    pe_out[(base+3) * n_pts + pt] = d_f2h(fast_cos(freq * py));
+    pe_out[(base+4) * n_pts + pt] = d_f2h(fast_sin(freq * pz));
+    pe_out[(base+5) * n_pts + pt] = d_f2h(fast_cos(freq * pz));
     freq *= 2.0f;
   }
   for (uint32_t f = MLP_IN_DIM; f < MLP_IN_DIM_PAD; ++f)
@@ -126,9 +154,16 @@ static inline void mlp_gemm_body(kernel_arg_t* arg) {
 
   for (int i = 0; i < (int)K_in; i += (int)tcu_ctx::tileK) {
     auto pTileA = pA + tile_row * K_in + i;
-    auto pTileB = pB + i * n_pts + tile_col;
     tcu_ctx::load_matrix_sync(fragA, pTileA, K_in);
+#ifdef AKILI_NERF_TILEDB
+    // Timing experiment only: contiguous tileK x tileN B block per K-tile.
+    auto pTileB = pB + ((size_t)blockIdx.x * (K_in / tcu_ctx::tileK) + i / tcu_ctx::tileK)
+                     * (tcu_ctx::tileK * tcu_ctx::tileN);
+    tcu_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, tcu_ctx::tileK);
+#else
+    auto pTileB = pB + i * n_pts + tile_col;
     tcu_ctx::load_matrix_sync(fragB, pTileB, n_pts);
+#endif
     tcu_ctx::mma_sync(fragC, fragA, fragB, fragC);
   }
 
@@ -174,7 +209,7 @@ static inline void mlp_out_act_body(kernel_arg_t* arg) {
   float r  = pY_fp32[1 * n_pts + tid] + pB[1];
   float g  = pY_fp32[2 * n_pts + tid] + pB[2];
   float b  = pY_fp32[3 * n_pts + tid] + pB[3];
-  pSig[tid]        = logf(1.0f + fast_exp(s));
+  pSig[tid]        = fast_log(1.0f + fast_exp(s));
   pRGB[tid*3 + 0]  = 1.0f / (1.0f + fast_exp(-r));
   pRGB[tid*3 + 1]  = 1.0f / (1.0f + fast_exp(-g));
   pRGB[tid*3 + 2]  = 1.0f / (1.0f + fast_exp(-b));

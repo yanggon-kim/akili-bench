@@ -24,18 +24,19 @@
 constexpr uint32_t kDescA = 0;
 constexpr uint32_t kDescB = 1;
 
-#ifndef NUM_THREADS
-#define NUM_THREADS 8
+#ifndef VX_CFG_NUM_THREADS
+#define VX_CFG_NUM_THREADS 8
 #endif
-#ifndef NUM_TCU_LANES
-#define NUM_TCU_LANES NUM_THREADS
+#ifndef VX_CFG_NUM_TCU_LANES
+#define VX_CFG_NUM_TCU_LANES VX_CFG_NUM_THREADS
 #endif
 
 #include <tensor_cfg.h>
+#include "wgmma_dxa_host.h"
 namespace vt = vortex::tensor;
-using cfg = vt::wmma_config_t<NUM_TCU_LANES, vt::fp16, vt::fp32>;
-static constexpr uint32_t TM = cfg::tileM;
-static constexpr uint32_t TN = cfg::tileN;
+using cfg = vt::wgmma_config_t<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, WGMMA_NRC>;
+static constexpr uint32_t TM = cfg::xtileM;
+static constexpr uint32_t TN = cfg::xtileN;
 static constexpr uint32_t TK = cfg::tileK;
 
 #define RT_CHECK(_expr)                                         \
@@ -230,7 +231,7 @@ static uint64_t read_back_cycles_tag(const char* tag, uint32_t num_blocks, bool 
   uint32_t max_cyc = 0;
   for (auto c : h_cycles) if (c > max_cyc) max_cyc = c;
   if (print)
-    printf("KCYC[%s,nt=%u]: %u\n", tag, (unsigned)NUM_THREADS, max_cyc);
+    printf("KCYC[%s,nt=%u]: %u\n", tag, (unsigned)VX_CFG_NUM_THREADS, max_cyc);
   return (uint64_t)max_cyc;
 }
 
@@ -243,12 +244,16 @@ int main(int argc, char* argv[]) {
 
   uint64_t NT_caps = 0;
   vx_dev_caps(device, VX_CAPS_NUM_THREADS, &NT_caps);
-  if ((uint32_t)NT_caps != NUM_THREADS) {
-    printf("Error: device NUM_THREADS=%u but built with NUM_THREADS=%u\n",
-           (unsigned)NT_caps, (unsigned)NUM_THREADS);
+  if ((uint32_t)NT_caps != VX_CFG_NUM_THREADS) {
+    printf("Error: device VX_CFG_NUM_THREADS=%u but built with VX_CFG_NUM_THREADS=%u\n",
+           (unsigned)NT_caps, (unsigned)VX_CFG_NUM_THREADS);
     cleanup();
     return -1;
   }
+  uint64_t issue_width = 0;
+  vx_dev_caps(device, VX_CAPS_ISSUE_WIDTH, &issue_width);
+  uint32_t wg_warps = akili_cta_warps(issue_width);
+  uint32_t cta_M = wg_warps * TM;
 
   // Require that n_rays * n_samples is a multiple of tileN = 8 and each
   // N_out is a multiple of tileM = 8 (enforced by MLP_W=64 and
@@ -406,17 +411,16 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_copy_to_dev(B2_buf, h_B2.data(), 0, h_B2.size()*sizeof(float)));
   RT_CHECK(vx_copy_to_dev(B3_buf, h_B3.data(), 0, h_B3.size()*sizeof(float)));
 
-  RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_mem_alloc(device, sizeof(kernel_arg_t), VX_MEM_READ_WRITE, &args_buffer));
 
   // Per-stage grid/block shapes. Largest grid sizes the cycle buffer.
-  uint32_t gd_setup      = (n_points + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t gd_setup      = (n_points + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
   uint32_t gd_gemm_x     = n_points / TN;
-  uint32_t gd_gemm_y_max = MLP_W / TM;  // layers 0..2 have N_out = MLP_W
+  uint32_t gd_gemm_y_max = MLP_W / cta_M;
   uint32_t gd_gemm_blocks_max = gd_gemm_x * gd_gemm_y_max;
-  uint32_t gd_act_max    = (MLP_W * n_points + NUM_THREADS - 1) / NUM_THREADS;
-  uint32_t gd_out_act    = (n_points + NUM_THREADS - 1) / NUM_THREADS;
-  uint32_t gd_comp       = (n_rays   + NUM_THREADS - 1) / NUM_THREADS;
+  uint32_t gd_act_max    = (MLP_W * n_points + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
+  uint32_t gd_out_act    = (n_points + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
+  uint32_t gd_comp       = (n_rays   + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
   uint32_t max_blocks    = gd_setup;
   if (gd_gemm_blocks_max > max_blocks) max_blocks = gd_gemm_blocks_max;
   if (gd_act_max > max_blocks) max_blocks = gd_act_max;
@@ -426,7 +430,7 @@ int main(int argc, char* argv[]) {
                         VX_MEM_READ_WRITE, &cycles_buffer));
   RT_CHECK(vx_mem_address(cycles_buffer, &kernel_arg.cycles_addr));
 
-  uint32_t block_dim[2] = {NUM_THREADS, 1};
+  uint32_t block_dim[2] = {VX_CFG_NUM_THREADS, 1};
 
   int errors = 0;
   const float atol = 1e-2f;
@@ -440,7 +444,8 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
   {
     uint32_t grid_dim[2] = {gd_setup, 1};
-    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
+    RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 1,
+                           grid_dim, block_dim, 0));
   }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
   cyc_setup = read_back_cycles_tag("SETUP", gd_setup, true);
@@ -533,22 +538,25 @@ int main(int argc, char* argv[]) {
     RT_CHECK(vx_dxa_program_desc_2d(device, kDescA, p.W_addr,
       /*size0=*/p.K_in, /*size1=*/p.N_out,
       /*stride0_bytes=*/p.K_in * sizeof(uint16_t),
-      /*tile0=*/TK, /*tile1=*/TM, /*elem_bytes=*/sizeof(uint16_t)));
+      /*tile0=*/akili_wg_stage_k<cfg>(false), /*tile1=*/cta_M, /*elem_bytes=*/sizeof(uint16_t)));
     RT_CHECK(vx_dxa_program_desc_2d(device, kDescB, p.X_addr,
       /*size0=*/n_points, /*size1=*/p.K_in,
       /*stride0_bytes=*/n_points * sizeof(uint16_t),
-      /*tile0=*/TN, /*tile1=*/TK, /*elem_bytes=*/sizeof(uint16_t)));
+      /*tile0=*/TN, /*tile1=*/akili_wg_stage_k<cfg>(false), /*elem_bytes=*/sizeof(uint16_t)));
+    RT_CHECK(akili_dxa_set_kmajor(device, kDescB, sizeof(uint16_t)));
 
     {
-      uint32_t grid_dim[2] = {n_points / TN, p.N_out / TM};
-      uint32_t gemm_smem = (TM * TK + TK * TN) * sizeof(uint16_t);
-      RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, gemm_smem));
+      uint32_t grid_dim[2] = {n_points / TN, p.N_out / cta_M};
+      uint32_t gemm_block[2] = {wg_warps * VX_CFG_NUM_THREADS, 1};
+      uint32_t gemm_smem = akili_wg_lmem_bytes<cfg>(cta_M, false);
+      RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 2,
+                             grid_dim, gemm_block, gemm_smem));
     }
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
     {
       char tag[32];
       std::snprintf(tag, sizeof(tag), "MLP_L%u_GEMM", (unsigned)L);
-      uint32_t nb = (n_points / TN) * (p.N_out / TM);
+      uint32_t nb = (n_points / TN) * (p.N_out / cta_M);
       cyc_mlp_gemm += read_back_cycles_tag(tag, nb, true);
     }
 
@@ -586,10 +594,11 @@ int main(int argc, char* argv[]) {
       kernel_arg.kernel_id = KID_MLP_ACT;
       RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
       uint32_t nt_act = p.N_out * n_points;
-      uint32_t nb_act = (nt_act + NUM_THREADS - 1) / NUM_THREADS;
+      uint32_t nb_act = (nt_act + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
       {
         uint32_t grid_dim[2] = {nb_act, 1};
-        RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
+        RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 1,
+                               grid_dim, block_dim, 0));
       }
       RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
       {
@@ -610,10 +619,11 @@ int main(int argc, char* argv[]) {
       // Layer 3: softplus/sigmoid → sigmas/rgbs
       kernel_arg.kernel_id = KID_MLP_OUT_ACT;
       RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-      uint32_t nb_oa = (n_points + NUM_THREADS - 1) / NUM_THREADS;
+      uint32_t nb_oa = (n_points + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
       {
         uint32_t grid_dim[2] = {nb_oa, 1};
-        RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
+        RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 1,
+                               grid_dim, block_dim, 0));
       }
       RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
       cyc_mlp_act += read_back_cycles_tag("MLP_OUT_ACT", nb_oa, true);
@@ -658,7 +668,8 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
   {
     uint32_t grid_dim[2] = {gd_comp, 1};
-    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 1, grid_dim, block_dim, 0));
+    RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 1,
+                           grid_dim, block_dim, 0));
   }
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
   cyc_comp = read_back_cycles_tag("COMP", gd_comp, true);
@@ -698,12 +709,12 @@ int main(int argc, char* argv[]) {
   uint64_t non_gemm = cyc_setup + cyc_mlp_act + cyc_comp;
   uint64_t gemm     = cyc_mlp_gemm;
   uint64_t total    = non_gemm + gemm;
-  printf("KCYC[SETUP,nt=%u]: %lu\n",    (unsigned)NUM_THREADS, (unsigned long)cyc_setup);
-  printf("KCYC[MLP_GEMM,nt=%u]: %lu\n", (unsigned)NUM_THREADS, (unsigned long)cyc_mlp_gemm);
-  printf("KCYC[MLP_ACT,nt=%u]: %lu\n",  (unsigned)NUM_THREADS, (unsigned long)cyc_mlp_act);
-  printf("KCYC[COMP,nt=%u]: %lu\n",     (unsigned)NUM_THREADS, (unsigned long)cyc_comp);
+  printf("KCYC[SETUP,nt=%u]: %lu\n",    (unsigned)VX_CFG_NUM_THREADS, (unsigned long)cyc_setup);
+  printf("KCYC[MLP_GEMM,nt=%u]: %lu\n", (unsigned)VX_CFG_NUM_THREADS, (unsigned long)cyc_mlp_gemm);
+  printf("KCYC[MLP_ACT,nt=%u]: %lu\n",  (unsigned)VX_CFG_NUM_THREADS, (unsigned long)cyc_mlp_act);
+  printf("KCYC[COMP,nt=%u]: %lu\n",     (unsigned)VX_CFG_NUM_THREADS, (unsigned long)cyc_comp);
   printf("KCYC[SUMMARY,nt=%u]: non_gemm=%lu gemm=%lu total=%lu",
-         (unsigned)NUM_THREADS,
+         (unsigned)VX_CFG_NUM_THREADS,
          (unsigned long)non_gemm, (unsigned long)gemm, (unsigned long)total);
   if (total > 0) printf("  (gemm_frac=%.3f)", (double)gemm / (double)total);
   printf("\n");

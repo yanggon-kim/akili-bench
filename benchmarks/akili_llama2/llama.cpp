@@ -32,6 +32,16 @@ typedef struct {
     int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
     int vocab_size; // vocabulary size, usually 256 (byte-level)
     int seq_len; // max sequence length
+    // --- RoPE scaling (v2/"LLM3" header only; see LLAMA_HDR_MAGIC in
+    // read_checkpoint below). Legacy Llama-2-style checkpoints (stories15M)
+    // don't carry these; the loader defaults rope_theta=10000 and
+    // rope_scaling_enabled=0 for them, matching the original unscaled RoPE.
+    float rope_theta;
+    int rope_scaling_enabled;
+    float rope_factor;              // e.g. Llama-3.2: 32.0
+    float rope_low_freq_factor;     // e.g. Llama-3.2: 1.0
+    float rope_high_freq_factor;    // e.g. Llama-3.2: 4.0
+    int rope_orig_max_pos;          // e.g. Llama-3.2: 8192
 } Config;
 
 typedef struct {
@@ -151,8 +161,36 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
                      int* fd, float** data, ssize_t* file_size) {
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
-    // read in the config header
-    if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
+    // read in the config header. v2 ("LLM3") header: magic int32 followed by
+    // the 7 legacy fields plus RoPE-scaling params. Legacy (Llama-2 style)
+    // checkpoints have no magic -- their first 4 bytes are just config->dim
+    // -- so on a mismatch we rewind and fall back to the original 7-field
+    // read with unscaled RoPE (theta=10000). Mirrors
+    // tests/regression/llama2/main.cpp's checkpoint loader.
+    static const int32_t LLAMA_HDR_MAGIC = 0x4c4c4d33; // "LLM3"
+    int32_t magic = 0;
+    size_t header_bytes;
+    if (fread(&magic, sizeof(int32_t), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (magic == LLAMA_HDR_MAGIC) {
+        if (fread(config, sizeof(int32_t), 7, file) != 7) { exit(EXIT_FAILURE); }
+        if (fread(&config->rope_theta, sizeof(float), 1, file) != 1) { exit(EXIT_FAILURE); }
+        if (fread(&config->rope_scaling_enabled, sizeof(int32_t), 1, file) != 1) { exit(EXIT_FAILURE); }
+        if (fread(&config->rope_factor, sizeof(float), 1, file) != 1) { exit(EXIT_FAILURE); }
+        if (fread(&config->rope_low_freq_factor, sizeof(float), 1, file) != 1) { exit(EXIT_FAILURE); }
+        if (fread(&config->rope_high_freq_factor, sizeof(float), 1, file) != 1) { exit(EXIT_FAILURE); }
+        if (fread(&config->rope_orig_max_pos, sizeof(int32_t), 1, file) != 1) { exit(EXIT_FAILURE); }
+        header_bytes = sizeof(int32_t) + 7 * sizeof(int32_t) + 6 * sizeof(int32_t);
+    } else {
+        fseek(file, 0, SEEK_SET);
+        if (fread(config, sizeof(int32_t), 7, file) != 7) { exit(EXIT_FAILURE); }
+        config->rope_theta = 10000.0f;
+        config->rope_scaling_enabled = 0;
+        config->rope_factor = 1.0f;
+        config->rope_low_freq_factor = 1.0f;
+        config->rope_high_freq_factor = 1.0f;
+        config->rope_orig_max_pos = 0;
+        header_bytes = 7 * sizeof(int32_t);
+    }
     // negative vocab size is hacky way of signaling unshared weights. bit yikes.
     int shared_weights = config->vocab_size > 0 ? 1 : 0;
     config->vocab_size = abs(config->vocab_size);
@@ -165,7 +203,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
     *data = (float*)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-    float* weights_ptr = *data + sizeof(Config)/sizeof(float);
+    float* weights_ptr = *data + header_bytes / sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
@@ -286,8 +324,33 @@ float* forward(Transformer* transformer, int token, int pos) {
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
             int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-            float val = pos * freq;
+            float inv_freq = 1.0f / powf(p->rope_theta, head_dim / (float)head_size);
+            // Llama-3 "llama3" RoPE scaling: blend original (unscaled) and
+            // 1/rope_factor-interpolated frequencies by wavelength, so short
+            // (high-frequency) rotations are untouched, long (low-frequency)
+            // ones are fully compressed by rope_factor, and the band in
+            // between smoothly interpolates. See transformers'
+            // _compute_llama3_parameters. Disabled (rope_scaling_enabled=0)
+            // on legacy Llama-2-style checkpoints, which use the plain
+            // inv_freq above unchanged. Ported from
+            // tests/regression/llama2/kernel.cpp's rope_k.
+            if (p->rope_scaling_enabled) {
+                float factor      = p->rope_factor;
+                float low_ff      = p->rope_low_freq_factor;
+                float high_ff     = p->rope_high_freq_factor;
+                float old_ctx     = (float)p->rope_orig_max_pos;
+                float low_freq_wl  = old_ctx / low_ff;
+                float high_freq_wl = old_ctx / high_ff;
+                float wavelen      = 6.28318530718f / inv_freq;
+                if (wavelen > low_freq_wl) {
+                    inv_freq = inv_freq / factor;
+                } else if (wavelen >= high_freq_wl) {
+                    float smooth = (old_ctx / wavelen - low_ff) / (high_ff - low_ff);
+                    inv_freq = (1.0f - smooth) * (inv_freq / factor) + smooth * inv_freq;
+                }
+                // else: wavelen < high_freq_wl -- high frequency, left unscaled.
+            }
+            float val = pos * inv_freq;
             float fcr = cosf(val);
             float fci = sinf(val);
             int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
@@ -387,6 +450,171 @@ float* forward(Transformer* transformer, int token, int pos) {
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
     return s->logits;
 }
+
+
+#ifndef LLAMA_BATCH
+#define LLAMA_BATCH 1
+#endif
+
+#if LLAMA_BATCH > 1
+// Batched decode: LLAMA_BATCH independent sequences advance one token per
+// step, so every projection is one GEMM with N = LLAMA_BATCH (activations
+// packed column-per-sequence) instead of LLAMA_BATCH matrix-vector products.
+// Sequence b samples with rng seed + b, so sequence 0 reproduces the
+// unbatched run. KV caches are sized for the requested steps only.
+typedef struct {
+    int B, max_pos;
+    float *x, *xb, *xb2, *hb, *hb2, *q, *kv_k, *kv_v, *att, *logits;
+    float *key_cache, *value_cache;   // [B][layer][max_pos][kv_dim]
+    float *pack_in, *pack_out;        // GEMM staging: [K x B], [M x B]
+} BatchState;
+
+static float* bcalloc(size_t n) {
+    float* p = (float*)calloc(n, sizeof(float));
+    if (!p) { fprintf(stderr, "batch malloc failed\n"); exit(EXIT_FAILURE); }
+    return p;
+}
+
+static void malloc_batch_state(BatchState* s, Config* p, int B, int max_pos) {
+    size_t kv_dim = (size_t)(p->dim * p->n_kv_heads) / p->n_heads;
+    size_t widest_in  = p->dim > p->hidden_dim ? p->dim : p->hidden_dim;
+    size_t widest_out = widest_in > (size_t)p->vocab_size ? widest_in : (size_t)p->vocab_size;
+    s->B = B; s->max_pos = max_pos;
+    s->x = bcalloc((size_t)B * p->dim);   s->xb = bcalloc((size_t)B * p->dim);
+    s->xb2 = bcalloc((size_t)B * p->dim); s->q = bcalloc((size_t)B * p->dim);
+    s->hb = bcalloc((size_t)B * p->hidden_dim); s->hb2 = bcalloc((size_t)B * p->hidden_dim);
+    s->kv_k = bcalloc((size_t)B * kv_dim); s->kv_v = bcalloc((size_t)B * kv_dim);
+    s->att = bcalloc((size_t)p->n_heads * max_pos);
+    s->logits = bcalloc((size_t)B * p->vocab_size);
+    s->key_cache = bcalloc((size_t)B * p->n_layers * max_pos * kv_dim);
+    s->value_cache = bcalloc((size_t)B * p->n_layers * max_pos * kv_dim);
+    s->pack_in = bcalloc(widest_in * B);
+    s->pack_out = bcalloc(widest_out * B);
+}
+
+static void free_batch_state(BatchState* s) {
+    free(s->x); free(s->xb); free(s->xb2); free(s->q); free(s->hb); free(s->hb2);
+    free(s->kv_k); free(s->kv_v); free(s->att); free(s->logits);
+    free(s->key_cache); free(s->value_cache); free(s->pack_in); free(s->pack_out);
+}
+
+// out[b][0..d) = W (d x n) @ in[b][0..n) for every sequence b, as one GEMM.
+static void bmatmul(BatchState* s, float* out, const float* in, float* w, int n, int d) {
+    int B = s->B;
+    for (int k = 0; k < n; k++)
+        for (int b = 0; b < B; b++)
+            s->pack_in[(size_t)k * B + b] = in[(size_t)b * n + k];
+    if (use_vortex) {
+        vx_matmul(s->pack_out, w, s->pack_in, d, B, n);
+    } else {
+        for (int i = 0; i < d; i++)
+            for (int b = 0; b < B; b++) {
+                float acc = 0.0f;
+                for (int k = 0; k < n; k++) acc += w[(size_t)i * n + k] * s->pack_in[(size_t)k * B + b];
+                s->pack_out[(size_t)i * B + b] = acc;
+            }
+    }
+    for (int i = 0; i < d; i++)
+        for (int b = 0; b < B; b++)
+            out[(size_t)b * d + i] = s->pack_out[(size_t)i * B + b];
+}
+
+static void rope_rotate(Config* p, float* q, float* k, int pos, int dim, int kv_dim, int head_size) {
+    for (int i = 0; i < dim; i += 2) {
+        int head_dim = i % head_size;
+        float inv_freq = 1.0f / powf(p->rope_theta, head_dim / (float)head_size);
+        if (p->rope_scaling_enabled) {
+            float factor = p->rope_factor, low_ff = p->rope_low_freq_factor;
+            float high_ff = p->rope_high_freq_factor, old_ctx = (float)p->rope_orig_max_pos;
+            float wavelen = 6.28318530718f / inv_freq;
+            if (wavelen > old_ctx / low_ff) {
+                inv_freq = inv_freq / factor;
+            } else if (wavelen >= old_ctx / high_ff) {
+                float smooth = (old_ctx / wavelen - low_ff) / (high_ff - low_ff);
+                inv_freq = (1.0f - smooth) * (inv_freq / factor) + smooth * inv_freq;
+            }
+        }
+        float val = pos * inv_freq, fcr = cosf(val), fci = sinf(val);
+        int rotn = i < kv_dim ? 2 : 1;
+        for (int v = 0; v < rotn; v++) {
+            float* vec = v == 0 ? q : k;
+            float v0 = vec[i], v1 = vec[i + 1];
+            vec[i] = v0 * fcr - v1 * fci;
+            vec[i + 1] = v0 * fci + v1 * fcr;
+        }
+    }
+}
+
+static float* forward_batch(Transformer* t, BatchState* s, const int* tokens, int pos) {
+    Config* p = &t->config;
+    TransformerWeights* w = &t->weights;
+    int B = s->B, dim = p->dim, hidden_dim = p->hidden_dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    int head_size = dim / p->n_heads;
+    size_t seq_kv = (size_t)p->n_layers * s->max_pos * kv_dim;
+
+    for (int b = 0; b < B; b++)
+        memcpy(s->x + (size_t)b * dim, w->token_embedding_table + (size_t)tokens[b] * dim, dim * sizeof(float));
+
+    for (unsigned long long l = 0; l < (unsigned long long)p->n_layers; l++) {
+        for (int b = 0; b < B; b++)
+            rmsnorm(s->xb + (size_t)b * dim, s->x + (size_t)b * dim, w->rms_att_weight + l * dim, dim);
+
+        bmatmul(s, s->q,    s->xb, w->wq + l * dim * dim,    dim, dim);
+        bmatmul(s, s->kv_k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
+        bmatmul(s, s->kv_v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
+
+        size_t loff = l * (size_t)s->max_pos * kv_dim;
+        for (int b = 0; b < B; b++) {
+            float* kc = s->key_cache + b * seq_kv + loff;
+            float* vc = s->value_cache + b * seq_kv + loff;
+            float* q = s->q + (size_t)b * dim;
+            memcpy(kc + (size_t)pos * kv_dim, s->kv_k + (size_t)b * kv_dim, kv_dim * sizeof(float));
+            memcpy(vc + (size_t)pos * kv_dim, s->kv_v + (size_t)b * kv_dim, kv_dim * sizeof(float));
+            rope_rotate(p, q, kc + (size_t)pos * kv_dim, pos, dim, kv_dim, head_size);
+
+            for (int h = 0; h < p->n_heads; h++) {
+                float* qh = q + h * head_size;
+                float* att = s->att + (size_t)h * s->max_pos;
+                for (int tt = 0; tt <= pos; tt++) {
+                    float* k = kc + (size_t)tt * kv_dim + (h / kv_mul) * head_size;
+                    float score = 0.0f;
+                    for (int i = 0; i < head_size; i++) score += qh[i] * k[i];
+                    att[tt] = score / sqrtf(head_size);
+                }
+                softmax(att, pos + 1);
+                float* xb = s->xb + (size_t)b * dim + h * head_size;
+                memset(xb, 0, head_size * sizeof(float));
+                for (int tt = 0; tt <= pos; tt++) {
+                    float* v = vc + (size_t)tt * kv_dim + (h / kv_mul) * head_size;
+                    for (int i = 0; i < head_size; i++) xb[i] += att[tt] * v[i];
+                }
+            }
+        }
+
+        bmatmul(s, s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
+        for (size_t i = 0; i < (size_t)B * dim; i++) s->x[i] += s->xb2[i];
+        for (int b = 0; b < B; b++)
+            rmsnorm(s->xb + (size_t)b * dim, s->x + (size_t)b * dim, w->rms_ffn_weight + l * dim, dim);
+
+        bmatmul(s, s->hb,  s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
+        bmatmul(s, s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
+        for (size_t i = 0; i < (size_t)B * hidden_dim; i++) {
+            float val = s->hb[i];
+            val *= 1.0f / (1.0f + expf(-val));
+            s->hb[i] = val * s->hb2[i];
+        }
+        bmatmul(s, s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
+        for (size_t i = 0; i < (size_t)B * dim; i++) s->x[i] += s->xb[i];
+    }
+
+    for (int b = 0; b < B; b++)
+        rmsnorm(s->x + (size_t)b * dim, s->x + (size_t)b * dim, w->rms_final_weight, dim);
+    bmatmul(s, s->logits, s->x, w->wcls, p->dim, p->vocab_size);
+    return s->logits;
+}
+#endif
 
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
@@ -753,6 +981,46 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
+
+#if LLAMA_BATCH > 1
+static void generate_batch(Transformer* t, Tokenizer* tokenizer, Sampler* sampler,
+                           const int* prompt_tokens, int num_prompt_tokens, int steps) {
+    const int B = LLAMA_BATCH;
+    BatchState s;
+    malloc_batch_state(&s, &t->config, B, steps);
+    Sampler samplers[LLAMA_BATCH];
+    for (int b = 0; b < B; b++) {
+        build_sampler(&samplers[b], t->config.vocab_size, sampler->temperature, sampler->topp,
+                      sampler->rng_state + (unsigned long long)b);
+    }
+    int tokens[LLAMA_BATCH], next[LLAMA_BATCH];
+    for (int b = 0; b < B; b++) tokens[b] = prompt_tokens[0];
+    printf("batch=%d\n", B);
+    long start = 0;
+    int pos = 0;
+    while (pos < steps) {
+        float* logits = forward_batch(t, &s, tokens, pos);
+        for (int b = 0; b < B; b++) {
+            next[b] = (pos < num_prompt_tokens - 1)
+                ? prompt_tokens[pos + 1]
+                : sample(&samplers[b], logits + (size_t)b * t->config.vocab_size);
+        }
+        pos++;
+        safe_printf(decode(tokenizer, tokens[0], next[0]));
+        fflush(stdout);
+        for (int b = 0; b < B; b++) tokens[b] = next[b];
+        if (start == 0) { start = time_in_ms(); }
+    }
+    printf("\n");
+    if (pos > 1) {
+        long end = time_in_ms();
+        fprintf(stderr, "achieved tok/s: %f (batch %d)\n", (double)B * (pos - 1) / (double)(end - start) * 1000, B);
+    }
+    for (int b = 0; b < B; b++) free_sampler(&samplers[b]);
+    free_batch_state(&s);
+}
+#endif
+
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
@@ -766,6 +1034,11 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         exit(EXIT_FAILURE);
     }
 
+#if LLAMA_BATCH > 1
+    generate_batch(transformer, tokenizer, sampler, prompt_tokens, num_prompt_tokens, steps);
+    free(prompt_tokens);
+    return;
+#endif
     // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence

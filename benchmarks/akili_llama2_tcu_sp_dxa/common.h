@@ -2,8 +2,15 @@
 
 #include <stdint.h>
 
-#ifndef NUM_THREADS
-#define NUM_THREADS 4
+#ifndef VX_CFG_NUM_THREADS
+#define VX_CFG_NUM_THREADS 4
+#endif
+
+// Stage count for the DEEP_BUF N-stage software-pipelined DXA kernel
+// (matmul_kernel.cpp). Unused unless DEEP_BUF is defined. Matches
+// tests/regression/llama2/common.h's default.
+#ifndef PIPE_N
+#define PIPE_N 4
 #endif
 
 typedef struct {

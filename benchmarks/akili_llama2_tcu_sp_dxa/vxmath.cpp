@@ -6,14 +6,16 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include "akili_ablock.h"
 
 #include <dxa.h>
 #include <rvfloats.h>
-#include <tensor.h>
+#include <tensor_sp.h>
 #include <tensor_cfg.h>
 #include <vortex.h>
 
 #include "common.h"
+#include "wgmma_dxa_host.h"
 
 #define RT_CHECK(_expr)                                         \
     do {                                                        \
@@ -25,7 +27,7 @@
     } while (false)
 
 namespace vt = vortex::tensor;
-using cfg = vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp32>;
+using cfg = vt::wgmma_config_t<VX_CFG_NUM_THREADS, vt::fp16, vt::fp32, WGMMA_NRC>;
 using itype_t = typename vt::fp16::dtype;
 using otype_t = typename vt::fp32::dtype;
 
@@ -36,15 +38,6 @@ using otype_t = typename vt::fp32::dtype;
 // DDR, removing the per-k-iter LSU stall that Option B still paid.
 constexpr uint32_t kDescA    = 0;  // compressed A [M × K/2]
 constexpr uint32_t kDescB    = 1;  // dense B [K × N] row-major
-constexpr uint32_t kDescMeta = 2;  // packed 2:4 meta, full per-M-tile slab
-
-// Meta sizing — mirrors baseline pack_metadata and the per-k-tile layout.
-static constexpr uint32_t kPerKTileWords = []{
-    constexpr uint32_t pd = cfg::m_steps * (cfg::k_steps / 2);
-    constexpr uint32_t mcols = cfg::meta_cols;
-    constexpr uint32_t num_meta_loads = (pd * mcols + NUM_THREADS - 1) / NUM_THREADS;
-    return num_meta_loads * NUM_THREADS;
-}();
 
 template <typename To, typename From>
 static To bit_cast(const From& src) {
@@ -140,6 +133,7 @@ struct SparseWeight {
 };
 
 static uint64_t num_threads = 0;
+static uint64_t issue_width = 0;
 static vx_device_h device = nullptr;
 static vx_buffer_h matmul_B_buffer = nullptr;
 static vx_buffer_h matmul_C_buffer = nullptr;
@@ -210,6 +204,7 @@ static void pack_row_major_fp16(std::vector<itype_t>& dst,
     }
 }
 
+#if 0
 static void pack_metadata(std::vector<uint32_t>& h_meta,
                           const std::vector<uint8_t>& masks,
                           uint32_t M,
@@ -221,11 +216,11 @@ static void pack_metadata(std::vector<uint32_t>& h_meta,
     constexpr uint32_t mcols = cfg::meta_cols;
     constexpr uint32_t half_k_steps = cfg::k_steps / 2;
     constexpr uint32_t pd = cfg::m_steps * (cfg::k_steps / 2);
-    constexpr uint32_t cols_per_load = (NUM_THREADS >= pd) ? (NUM_THREADS / pd) : 1;
-    constexpr uint32_t banks_per_store = (NUM_THREADS < pd) ? NUM_THREADS : pd;
-    constexpr uint32_t stores_per_col = (pd + NUM_THREADS - 1) / NUM_THREADS;
-    constexpr uint32_t num_meta_loads = (pd * mcols + NUM_THREADS - 1) / NUM_THREADS;
-    constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_THREADS;
+    constexpr uint32_t cols_per_load = (VX_CFG_NUM_THREADS >= pd) ? (VX_CFG_NUM_THREADS / pd) : 1;
+    constexpr uint32_t banks_per_store = (VX_CFG_NUM_THREADS < pd) ? VX_CFG_NUM_THREADS : pd;
+    constexpr uint32_t stores_per_col = (pd + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
+    constexpr uint32_t num_meta_loads = (pd * mcols + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
+    constexpr uint32_t per_k_tile_words = num_meta_loads * VX_CFG_NUM_THREADS;
 
     uint32_t tile_k_elem = cfg::tileK;
     uint32_t num_groups_per_row = K / 4;
@@ -271,7 +266,7 @@ static void pack_metadata(std::vector<uint32_t>& h_meta,
                                 uint32_t flat_store = word_idx * stores_per_col + store_in_col;
                                 uint32_t load_idx = flat_store / cols_per_load;
                                 uint32_t store_in_load = flat_store % cols_per_load;
-                                uint32_t meta_idx = load_idx * NUM_THREADS + store_in_load * banks_per_store + thread_in_store;
+                                uint32_t meta_idx = load_idx * VX_CFG_NUM_THREADS + store_in_load * banks_per_store + thread_in_store;
                                 h_meta[section_base + meta_idx] |= (1u << bit_idx);
                             }
                         }
@@ -281,6 +276,7 @@ static void pack_metadata(std::vector<uint32_t>& h_meta,
         }
     }
 }
+#endif
 
 static std::unique_ptr<SparseWeight> prepare_sparse_weight(const float* dense_weight,
                                                            uint32_t rows,
@@ -288,8 +284,12 @@ static std::unique_ptr<SparseWeight> prepare_sparse_weight(const float* dense_we
     auto weight = std::make_unique<SparseWeight>();
     weight->logical_rows = rows;
     weight->logical_cols = cols;
-    weight->padded_rows = round_up(rows, cfg::tileM);
-    weight->padded_cols = round_up(cols, cfg::tileK);
+    weight->padded_rows = round_up(rows, issue_width * cfg::xtileM);
+#ifdef AKILI_A_BLOCKED
+    weight->padded_cols = round_up(cols, 2 * kABlockCols);
+#else
+    weight->padded_cols = round_up(cols, cfg::tileK_sp);
+#endif
 
     size_t dense_size = static_cast<size_t>(weight->padded_rows) * weight->padded_cols;
     size_t sparse_size = dense_size / 2;
@@ -315,7 +315,12 @@ static std::unique_ptr<SparseWeight> prepare_sparse_weight(const float* dense_we
         exit(-1);
     }
 
-    pack_metadata(packed_meta, masks, weight->padded_rows, weight->padded_cols);
+    akili_pack_wgmma_metadata<cfg, vt::fp16>(packed_meta, masks,
+                                             weight->padded_rows,
+                                             weight->padded_cols);
+#ifdef AKILI_A_BLOCKED
+    akili_block_a(compressed_fp16, weight->padded_rows, weight->padded_cols / 2);
+#endif
 
     RT_CHECK(vx_mem_alloc(device, compressed_fp16.size() * sizeof(itype_t), VX_MEM_READ, &weight->data_buffer));
     RT_CHECK(vx_mem_address(weight->data_buffer, &weight->data_addr));
@@ -411,27 +416,28 @@ static SparseWeight* get_or_create_ffn_weight(const float* w1,
 static void program_dxa_descriptors(const SparseWeight* weight, uint32_t padded_N) {
     uint32_t padded_K = weight->padded_cols;
     uint32_t padded_M = weight->padded_rows;
-    uint32_t num_tile_rows = padded_M / cfg::tileM;
-    uint32_t num_k_tiles   = padded_K / cfg::tileK;
-    uint32_t slab_words    = num_k_tiles * kPerKTileWords;
-
+#ifdef AKILI_A_BLOCKED
+    RT_CHECK(vx_dxa_program_desc_2d(device, kDescA, weight->data_addr,
+        /*size0=*/(padded_K / 2) * kABlockRows, /*size1=*/padded_M / kABlockRows,
+        /*stride0_bytes=*/(padded_K / 2) * kABlockRows * sizeof(itype_t),
+        /*tile0=*/kABlockElems, /*tile1=*/issue_width * cfg::xtileM / kABlockRows,
+        /*elem_bytes=*/sizeof(itype_t)));
+#else
     RT_CHECK(vx_dxa_program_desc_2d(device, kDescA, weight->data_addr,
         /*size0=*/padded_K / 2, /*size1=*/padded_M,
         /*stride0_bytes=*/(padded_K / 2) * sizeof(itype_t),
-        /*tile0=*/cfg::tileK / 2, /*tile1=*/cfg::tileM,
+        /*tile0=*/akili_wg_stage_k<cfg>(true) / 2, /*tile1=*/issue_width * cfg::xtileM,
         /*elem_bytes=*/sizeof(itype_t)));
+#endif
+    RT_CHECK(akili_wg_program_meta<cfg>(device, kDescA, weight->meta_addr, padded_M, padded_K,
+                                        issue_width * cfg::xtileM));
 
     RT_CHECK(vx_dxa_program_desc_2d(device, kDescB, matmul_kernel_arg.B_addr,
         /*size0=*/padded_N, /*size1=*/padded_K,
         /*stride0_bytes=*/padded_N * sizeof(itype_t),
-        /*tile0=*/cfg::tileN, /*tile1=*/cfg::tileK,
+        /*tile0=*/cfg::xtileN, /*tile1=*/akili_wg_stage_k<cfg>(true),
         /*elem_bytes=*/sizeof(itype_t)));
-
-    RT_CHECK(vx_dxa_program_desc_2d(device, kDescMeta, weight->meta_addr,
-        /*size0=*/slab_words, /*size1=*/num_tile_rows,
-        /*stride0_bytes=*/slab_words * sizeof(uint32_t),
-        /*tile0=*/slab_words, /*tile1=*/1,
-        /*elem_bytes=*/sizeof(uint32_t)));
+    RT_CHECK(akili_dxa_set_kmajor(device, kDescB, sizeof(itype_t)));
 }
 
 static void run_sparse_matmul(float* C,
@@ -440,7 +446,7 @@ static void run_sparse_matmul(float* C,
                               uint32_t M,
                               uint32_t N,
                               uint32_t K) {
-    uint32_t padded_N = round_up(N, cfg::tileN);
+    uint32_t padded_N = round_up(N, cfg::xtileN);
     size_t sizeB = static_cast<size_t>(weight->padded_cols) * padded_N;
     size_t sizeC = static_cast<size_t>(weight->padded_rows) * padded_N;
 
@@ -460,10 +466,7 @@ static void run_sparse_matmul(float* C,
     ensure_buffer(&matmul_C_buffer, &cached_C_bytes, sizeC * sizeof(otype_t),
                   VX_MEM_WRITE, &matmul_kernel_arg.C_addr);
 
-    if (!kernel_loaded) {
-        RT_CHECK(vx_upload_kernel_file(device, kernel, &matmul_krnl_buffer));
-        kernel_loaded = true;
-    }
+    kernel_loaded = true;
 
     if (!matmul_args_buffer) {
         RT_CHECK(vx_mem_alloc(device, sizeof(matmul_kernel_args_t), VX_MEM_READ, &matmul_args_buffer));
@@ -477,13 +480,14 @@ static void run_sparse_matmul(float* C,
 
     RT_CHECK(vx_copy_to_dev(matmul_args_buffer, &matmul_kernel_arg, 0, sizeof(matmul_kernel_args_t)));
 
-    uint32_t grid_dim[2] = {padded_N / cfg::tileN, weight->padded_rows / cfg::tileM};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
-    // Task 8 HYBRID: only B tile in SMEM (A + meta loaded inline from gmem).
-    uint32_t smem_size = cfg::tileK * cfg::tileN * sizeof(itype_t);
+    uint32_t wg_warps = static_cast<uint32_t>(issue_width);
+    uint32_t cta_M = wg_warps * cfg::xtileM;
+    uint32_t grid_dim[2] = {padded_N / cfg::xtileN, weight->padded_rows / cta_M};
+    uint32_t block_dim[2] = {wg_warps * VX_CFG_NUM_THREADS, 1};
+    uint32_t smem_size = akili_wg_lmem_bytes<cfg>(cta_M, true);
 
-    RT_CHECK(vx_start_g(device, matmul_krnl_buffer, matmul_args_buffer, 2,
-                        grid_dim, block_dim, smem_size));
+    RT_CHECK(akili_start_g(device, &matmul_kernel_arg, sizeof(matmul_kernel_arg),
+                           2, grid_dim, block_dim, smem_size));
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
     RT_CHECK(vx_copy_from_dev(host_C.data(), matmul_C_buffer, 0, sizeC * sizeof(otype_t)));
 
@@ -510,11 +514,13 @@ void vx_init() {
     }
 
     RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_THREADS, &num_threads));
-    if (num_threads != NUM_THREADS) {
-        std::cerr << "TCU kernel expects NUM_THREADS=" << NUM_THREADS
+    if (num_threads != VX_CFG_NUM_THREADS) {
+        std::cerr << "TCU kernel expects VX_CFG_NUM_THREADS=" << VX_CFG_NUM_THREADS
                   << ", but device reports " << num_threads << std::endl;
         exit(-1);
     }
+    RT_CHECK(vx_dev_caps(device, VX_CAPS_ISSUE_WIDTH, &issue_width));
+    issue_width = akili_cta_warps(issue_width);
 }
 
 void matmul_cleanup() {

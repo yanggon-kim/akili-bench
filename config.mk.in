@@ -14,7 +14,7 @@ LIBCRT_VORTEX        ?= $(TOOLDIR)/libcrt$(XLEN)
 
 # Third-party and common paths (from Vortex source)
 THIRD_PARTY_DIR ?= $(VORTEX_HOME)/third_party
-SW_COMMON_DIR   ?= $(VORTEX_HOME)/sim/common
+SW_COMMON_DIR   ?= $(VORTEX_HOME)/sw/common
 
 # Benchmark repo root
 BENCH_ROOT := $(dir $(lastword $(MAKEFILE_LIST)))

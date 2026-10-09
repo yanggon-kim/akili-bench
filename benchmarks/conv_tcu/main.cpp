@@ -18,7 +18,7 @@
 #endif
 
 #include <tensor_cfg.h>
-#include <tensor.h>  // prune_2to4_matrix, compress_2to4_matrix
+#include <tensor_sp.h>  // prune_2to4_matrix, compress_2to4_matrix
 namespace vt = vortex::tensor;
 using cfg = vt::wmma_config_t<NUM_TCU_LANES, vt::fp16, vt::fp32>;
 static constexpr uint32_t TM = cfg::tileM;

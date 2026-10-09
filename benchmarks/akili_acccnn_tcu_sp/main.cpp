@@ -13,22 +13,23 @@
 #include <cstring>
 #include <vector>
 #include <vortex.h>
+#include "wgmma_dxa_host.h"
 #include <cmath>
 #include <algorithm>
 #include <stdio.h>
 #include "common.h"
 
-#ifndef NUM_THREADS
-#define NUM_THREADS 8
+#ifndef VX_CFG_NUM_THREADS
+#define VX_CFG_NUM_THREADS 8
 #endif
-#ifndef NUM_TCU_LANES
-#define NUM_TCU_LANES NUM_THREADS
+#ifndef VX_CFG_NUM_TCU_LANES
+#define VX_CFG_NUM_TCU_LANES VX_CFG_NUM_THREADS
 #endif
 
 #include <tensor_cfg.h>
-#include <tensor.h>  // prune_2to4_matrix, compress_2to4_matrix
+#include <tensor_sp.h>  // prune_2to4_matrix, compress_2to4_matrix
 namespace vt = vortex::tensor;
-using cfg = vt::wmma_config_t<NUM_TCU_LANES, vt::fp16, vt::fp32>;
+using cfg = vt::wmma_config_t<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32>;
 static constexpr uint32_t TM = cfg::tileM;
 static constexpr uint32_t TN = cfg::tileN;
 static constexpr uint32_t TK = cfg::tileK;
@@ -59,11 +60,11 @@ static void pack_metadata(std::vector<uint32_t>& h_meta,
   constexpr uint32_t mcols = cfg::meta_cols;
   constexpr uint32_t half_k_steps = cfg::k_steps / 2;
   constexpr uint32_t PD = cfg::m_steps * (cfg::k_steps / 2);
-  constexpr uint32_t banks_per_store = (NUM_THREADS < PD) ? NUM_THREADS : PD;
-  constexpr uint32_t stores_per_col = (PD + NUM_THREADS - 1) / NUM_THREADS;
-  constexpr uint32_t cols_per_load = (NUM_THREADS >= PD) ? (NUM_THREADS / PD) : 1;
-  constexpr uint32_t num_meta_loads = (PD * mcols + NUM_THREADS - 1) / NUM_THREADS;
-  constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_THREADS;
+  constexpr uint32_t banks_per_store = (VX_CFG_NUM_THREADS < PD) ? VX_CFG_NUM_THREADS : PD;
+  constexpr uint32_t stores_per_col = (PD + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
+  constexpr uint32_t cols_per_load = (VX_CFG_NUM_THREADS >= PD) ? (VX_CFG_NUM_THREADS / PD) : 1;
+  constexpr uint32_t num_meta_loads = (PD * mcols + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
+  constexpr uint32_t per_k_tile_words = num_meta_loads * VX_CFG_NUM_THREADS;
 
   uint32_t tileK_elem = cfg::tileK;
   uint32_t num_groups_per_row = K / 4;
@@ -104,7 +105,7 @@ static void pack_metadata(std::vector<uint32_t>& h_meta,
                 uint32_t flat_store = word_idx * stores_per_col + store_in_col;
                 uint32_t load_idx = flat_store / cols_per_load;
                 uint32_t store_in_load = flat_store % cols_per_load;
-                uint32_t meta_idx = load_idx * NUM_THREADS + store_in_load * banks_per_store + thread_in_store;
+                uint32_t meta_idx = load_idx * VX_CFG_NUM_THREADS + store_in_load * banks_per_store + thread_in_store;
                 h_meta[section_base + meta_idx] |= (1u << bit_idx);
               }
             }
@@ -258,7 +259,7 @@ static uint64_t read_back_cycles(const char* tag, uint32_t num_blocks) {
   vx_copy_from_dev(h_cycles.data(), cycles_buffer, 0, num_blocks * sizeof(uint32_t));
   uint32_t max_cyc = 0;
   for (auto c : h_cycles) if (c > max_cyc) max_cyc = c;
-  printf("KCYC[%s,nt=%u]: %u\n", tag, (unsigned)NUM_THREADS, max_cyc);
+  printf("KCYC[%s,nt=%u]: %u\n", tag, (unsigned)VX_CFG_NUM_THREADS, max_cyc);
   return (uint64_t)max_cyc;
 }
 
@@ -269,9 +270,9 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_dev_open(&device));
   uint64_t NT_caps = 0;
   vx_dev_caps(device, VX_CAPS_NUM_THREADS, &NT_caps);
-  if ((uint32_t)NT_caps != NUM_THREADS) {
-    printf("Error: device NUM_THREADS=%u but built with NUM_THREADS=%u\n",
-           (unsigned)NT_caps, (unsigned)NUM_THREADS);
+  if ((uint32_t)NT_caps != VX_CFG_NUM_THREADS) {
+    printf("Error: device VX_CFG_NUM_THREADS=%u but built with VX_CFG_NUM_THREADS=%u\n",
+           (unsigned)NT_caps, (unsigned)VX_CFG_NUM_THREADS);
     cleanup();
     return -1;
   }
@@ -350,7 +351,7 @@ int main(int argc, char* argv[]) {
   size_t   O_bytes     = (size_t)M_gemm * N_gemm * sizeof(float);
 
   uint32_t grid_dim[2]  = {N_gemm / TN, M_gemm / TM};
-  uint32_t block_dim[2] = {NUM_THREADS, 1};
+  uint32_t block_dim[2] = {VX_CFG_NUM_THREADS, 1};
   uint32_t num_blocks   = grid_dim[0] * grid_dim[1];
 
   RT_CHECK(vx_mem_alloc(device, wsp_bytes,   VX_MEM_READ_WRITE, &Wsp_buffer));
@@ -371,7 +372,6 @@ int main(int argc, char* argv[]) {
   (void)h_Icol_tiled;
   RT_CHECK(vx_copy_to_dev(Icol_buffer,   h_Icol_fp16.data(),    0, icol_bytes));
 
-  RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_mem_alloc(device, sizeof(kernel_arg_t), VX_MEM_READ_WRITE, &args_buffer));
 
   kernel_arg.C_in  = C_in;
@@ -385,7 +385,7 @@ int main(int argc, char* argv[]) {
   kernel_arg.N_gemm = N_gemm;
   kernel_arg.K_gemm = K_gemm;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-  RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, 0));
+  RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 2, grid_dim, block_dim, 0));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
   read_back_cycles("CONV", num_blocks);
 

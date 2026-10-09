@@ -11,12 +11,14 @@
 #include <vx_intrinsics.h>
 #include <vx_dxa.h>
 #include <vx_barrier.h>
+#include "wgmma_dxa_kernel.h"
 #include "common.h"
 #include <cmath>
 #include <algorithm>
 
 namespace vt = vortex::tensor;
-using ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
+using ctx = vt::wgmma_context<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, false,
+                              WGMMA_NRC>;
 
 // Descriptor slots.
 constexpr uint32_t kDescA_QK = 0;
@@ -38,19 +40,19 @@ static inline float fast_exp(float x) {
 // Stage 2: SIMT softmax on fp32 S. One thread per row. No DXA, no smem.
 // =============================================================================
 static void softmax_body(kernel_arg_t* __UNIFORM__ arg) {
-  // Launched with grid={NUM_WARPS,1}, block={NUM_THREADS,1}: 1 CTA per warp,
-  // full NUM_WARPS × NUM_THREADS hardware threads striped across N rows.
+  // Launched with grid={VX_CFG_NUM_WARPS,1}, block={VX_CFG_NUM_THREADS,1}: 1 CTA per warp,
+  // full VX_CFG_NUM_WARPS × VX_CFG_NUM_THREADS hardware threads striped across N rows.
   // Matches baseline's vortex1 vx_spawn_threads parallelism (which distributes
   // N logical threads across all available HW threads). Earlier attempts with
   // grid={N,1}/block={1,1} paid ~70K cycles KMU dispatch overhead per CTA;
-  // grid={1,1}/block={NUM_THREADS,1} only got 8-way parallelism (vs 64-way
+  // grid={1,1}/block={VX_CFG_NUM_THREADS,1} only got 8-way parallelism (vs 64-way
   // baseline).
   auto S = reinterpret_cast<float*>(arg->S_addr);
   auto P = reinterpret_cast<float*>(arg->P_addr);
   uint32_t N = arg->N;
 
-  uint32_t hw_tid = blockIdx.x * NUM_THREADS + threadIdx.x;
-  uint32_t stride = gridDim.x * NUM_THREADS;
+  uint32_t hw_tid = blockIdx.x * VX_CFG_NUM_THREADS + threadIdx.x;
+  uint32_t stride = gridDim.x * VX_CFG_NUM_THREADS;
 
   for (uint32_t row = hw_tid; row < N; row += stride) {
     float max_val = S[row * N];
@@ -78,74 +80,12 @@ static void softmax_body(kernel_arg_t* __UNIFORM__ arg) {
 // =============================================================================
 static void qk_tcu_body(kernel_arg_t* __UNIFORM__ arg) {
   auto pC_base = reinterpret_cast<ctx::output_t*>(arg->S_addr);
-  uint32_t K_walk = arg->d;
-  uint32_t c_stride = arg->N;
-
-  ctx::fragment_a   fragA;
-  ctx::fragment_b   fragB;
-  ctx::fragment_acc fragC;
-
-  uint32_t tile_row = blockIdx.y * ctx::tileM;
-  uint32_t tile_col = blockIdx.x * ctx::tileN;
-  ctx::fill_fragment(fragC, 0);
-
-  auto smem   = reinterpret_cast<ctx::input_t*>(__local_mem());
-  auto A_smem = smem;
-  auto B_smem = smem + ctx::tileM * ctx::tileK;
-
-  vortex::barrier bar(0);
-  const bool is_dxa_warp = (csr_read(VX_CSR_CTA_RANK) == 0);
-
-  for (uint32_t i = 0; i < K_walk; i += ctx::tileK) {
-    if (is_dxa_warp) {
-      vx_dxa_issue_2d_wg(kDescA_QK, bar.id(), A_smem, i, tile_row);
-      vx_dxa_issue_2d_wg(kDescB_QK, bar.id(), B_smem, i, tile_col);
-    }
-    bar.arrive_and_wait();
-    ctx::load_matrix_sync(fragA, A_smem, ctx::tileK);
-    ctx::load_matrix_sync<vt::col_major>(fragB, B_smem, ctx::tileK);
-    ctx::mma_sync(fragC, fragA, fragB, fragC);
-    bar.arrive_and_wait();
-  }
-
-  auto pTileC = pC_base + tile_row * c_stride + tile_col;
-  ctx::store_matrix_sync(pTileC, fragC, c_stride);
+  akili::wgmma_dxa<ctx>(pC_base, arg->N, arg->d, kDescA_QK, kDescB_QK);
 }
 
 static void pv_tcu_body(kernel_arg_t* __UNIFORM__ arg) {
   auto pC_base = reinterpret_cast<ctx::output_t*>(arg->O_addr);
-  uint32_t K_walk = arg->N;
-  uint32_t c_stride = arg->d;
-
-  ctx::fragment_a   fragA;
-  ctx::fragment_b   fragB;
-  ctx::fragment_acc fragC;
-
-  uint32_t tile_row = blockIdx.y * ctx::tileM;
-  uint32_t tile_col = blockIdx.x * ctx::tileN;
-  ctx::fill_fragment(fragC, 0);
-
-  auto smem   = reinterpret_cast<ctx::input_t*>(__local_mem());
-  auto A_smem = smem;
-  auto B_smem = smem + ctx::tileM * ctx::tileK;
-
-  vortex::barrier bar(0);
-  const bool is_dxa_warp = (csr_read(VX_CSR_CTA_RANK) == 0);
-
-  for (uint32_t i = 0; i < K_walk; i += ctx::tileK) {
-    if (is_dxa_warp) {
-      vx_dxa_issue_2d_wg(kDescA_PV, bar.id(), A_smem, i, tile_row);
-      vx_dxa_issue_2d_wg(kDescB_PV, bar.id(), B_smem, i, tile_col);
-    }
-    bar.arrive_and_wait();
-    ctx::load_matrix_sync(fragA, A_smem, ctx::tileK);
-    ctx::load_matrix_sync<vt::col_major>(fragB, B_smem, ctx::tileK);
-    ctx::mma_sync(fragC, fragA, fragB, fragC);
-    bar.arrive_and_wait();
-  }
-
-  auto pTileC = pC_base + tile_row * c_stride + tile_col;
-  ctx::store_matrix_sync(pTileC, fragC, c_stride);
+  akili::wgmma_dxa<ctx>(pC_base, arg->d, arg->N, kDescA_PV, kDescB_PV);
 }
 
 // =============================================================================

@@ -15,8 +15,13 @@ TARGET ?= opaesim
 XRT_SYN_DIR ?= $(VORTEX_HOME)/hw/syn/xilinx/xrt
 XRT_DEVICE_INDEX ?= 0
 
-VORTEX_RT_PATH ?= $(VORTEX_BUILD)/runtime
-VORTEX_KN_PATH ?= $(VORTEX_BUILD)/kernel
+# Vortex moved to an in-tree build: runtime/kernel libs and headers live
+# under $(VORTEX_HOME)/sw/{runtime,kernel} directly, not a separate
+# $(VORTEX_BUILD)/{runtime,kernel} tree. Generated hw headers (VX_config.vh
+# etc.) live at $(VORTEX_HOME)/hw. VORTEX_BUILD is kept only for config.mk
+# compatibility; it is otherwise unused below.
+VORTEX_RT_PATH ?= $(VORTEX_HOME)/sw/runtime
+VORTEX_KN_PATH ?= $(VORTEX_HOME)/sw/kernel
 
 # Kernel runtime library selection.
 #   KERNEL_LIB ?= vortex   → legacy vx_spawn.h + int main() kernels
@@ -41,7 +46,8 @@ endif
 
 LLVM_CFLAGS += --sysroot=$(RISCV_SYSROOT)
 LLVM_CFLAGS += --gcc-toolchain=$(RISCV_TOOLCHAIN_PATH)
-LLVM_CFLAGS += -Xclang -target-feature -Xclang +vortex
+LLVM_CFLAGS += --target=$(RISCV_PREFIX)
+LLVM_CFLAGS += -Xclang -target-feature -Xclang +xvortex
 LLVM_CFLAGS += -Xclang -target-feature -Xclang +zicond
 LLVM_CFLAGS += -mllvm -disable-loop-idiom-all
 
@@ -50,26 +56,31 @@ VX_CXX = $(LLVM_VORTEX)/bin/clang++ $(LLVM_CFLAGS)
 VX_DP  = $(LLVM_VORTEX)/bin/llvm-objdump
 VX_CP  = $(LLVM_VORTEX)/bin/llvm-objcopy
 
+XCONFIGS := $(shell python3 $(VORTEX_HOME)/ci/gen_config.py --config=$(VORTEX_HOME)/VX_config.toml --cflags='$(CONFIGS) -DVX_CFG_XLEN=$(XLEN)')
+
 VX_CFLAGS += -O3 -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -nostdlib -fdata-sections -ffunction-sections
-VX_CFLAGS += -I$(VORTEX_HOME)/kernel/include -I$(VORTEX_BUILD)/hw -I$(SW_COMMON_DIR)
+VX_CFLAGS += -I$(VORTEX_HOME)/sw/kernel/include -I$(VORTEX_HOME)/sw -I$(VORTEX_HOME)/hw -I$(SW_COMMON_DIR)
+VX_CFLAGS += -I$(BENCH_ROOT)/common
 VX_CFLAGS += -DXLEN_$(XLEN)
 VX_CFLAGS += -DNDEBUG
 VX_CFLAGS += $(CONFIGS)
+VX_CFLAGS += $(XCONFIGS)
 
 VX_LIBS += -L$(LIBC_VORTEX)/lib -lm -lc
 VX_LIBS += $(LIBCRT_VORTEX)/lib/baremetal/libclang_rt.builtins-riscv$(XLEN).a
 
-VX_LDFLAGS += -Wl,-Bstatic,--gc-sections,-T,$(VORTEX_HOME)/kernel/scripts/link$(XLEN).ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR) $(VORTEX_KN_PATH)/lib$(KERNEL_LIB).a $(VX_LIBS)
+VX_LDFLAGS += -Wl,-Bstatic,--gc-sections,-T,$(VORTEX_HOME)/sw/kernel/scripts/link$(XLEN).ld,--defsym=STARTUP_ADDR=$(STARTUP_ADDR) $(VORTEX_KN_PATH)/lib$(KERNEL_LIB).a $(VX_LIBS)
 
-VX_STARTUP_SRC := $(VORTEX_HOME)/kernel/src/vx_start.S
+VX_STARTUP_SRC := $(VORTEX_HOME)/sw/kernel/src/vx_start.S
 VX_KMU_FLAG    := $(if $(filter vortex2,$(KERNEL_LIB)),-DKMU_ENABLE)
 VX_APP_OBJS    = $(addsuffix .o, $(basename $(notdir $(VX_SRCS))))
-KERNEL_STARTUP := $(VORTEX_HOME)/kernel/scripts/kernel_startup.sh
+KERNEL_STARTUP := $(VORTEX_HOME)/sw/kernel/scripts/kernel_startup.sh
 
 CXXFLAGS += -std=c++17 -Wall -Wextra -pedantic -Wfatal-errors
-CXXFLAGS += -I$(VORTEX_HOME)/runtime/include -I$(VORTEX_BUILD)/hw -I$(SW_COMMON_DIR)
+CXXFLAGS += -I$(VORTEX_HOME)/sw/runtime/include -I$(VORTEX_HOME)/sw -I$(VORTEX_HOME)/hw -I$(SW_COMMON_DIR)
 CXXFLAGS += -I$(BENCH_ROOT)/common
 CXXFLAGS += $(CONFIGS)
+CXXFLAGS += $(XCONFIGS)
 
 LDFLAGS += -L$(VORTEX_RT_PATH) -lvortex
 
@@ -98,7 +109,7 @@ kernel.dump: kernel.elf
 	$(VX_DP) -D $< > $@
 
 kernel.vxbin: kernel.elf
-	OBJCOPY=$(VX_CP) $(VORTEX_HOME)/kernel/scripts/vxbin.py $< $@
+	OBJCOPY=$(VX_CP) $(VORTEX_HOME)/sw/kernel/scripts/vxbin.py $< $@
 
 ifeq ($(KERNEL_LIB),vortex2)
 # Two-pass build for KMU kernels: detect startup feature flags from a
@@ -131,9 +142,9 @@ run-opae: $(PROJECT) kernel.vxbin
 
 run-xrt: $(PROJECT) kernel.vxbin
 ifeq ($(TARGET), hw)
-	SCOPE_JSON_PATH=$(FPGA_BIN_DIR)/scope.json XRT_INI_PATH=$(VORTEX_RT_PATH)/xrt/xrt.ini EMCONFIG_PATH=$(FPGA_BIN_DIR) XRT_DEVICE_INDEX=$(XRT_DEVICE_INDEX) XRT_XCLBIN_PATH=$(FPGA_BIN_DIR)/vortex_afu.xclbin LD_LIBRARY_PATH=$(XILINX_XRT)/lib:$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=xrt ./$(PROJECT) $(OPTS)
+	SCOPE_JSON_PATH=$(FPGA_BIN_DIR)/scope.json XRT_INI_PATH=$(VORTEX_RT_PATH)/xrt/xrt.ini EMCONFIG_PATH=$(FPGA_BIN_DIR) XRT_DEVICE_INDEX=$(XRT_DEVICE_INDEX) XCLBIN_PATH=$(FPGA_BIN_DIR)/vortex_afu.xclbin LD_LIBRARY_PATH=$(XILINX_XRT)/lib:$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=xrt ./$(PROJECT) $(OPTS)
 else ifeq ($(TARGET), hw_emu)
-	SCOPE_JSON_PATH=$(FPGA_BIN_DIR)/scope.json XCL_EMULATION_MODE=$(TARGET) XRT_INI_PATH=$(VORTEX_RT_PATH)/xrt/xrt.ini EMCONFIG_PATH=$(FPGA_BIN_DIR) XRT_DEVICE_INDEX=$(XRT_DEVICE_INDEX) XRT_XCLBIN_PATH=$(FPGA_BIN_DIR)/vortex_afu.xclbin LD_LIBRARY_PATH=$(XILINX_XRT)/lib:$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=xrt ./$(PROJECT) $(OPTS)
+	SCOPE_JSON_PATH=$(FPGA_BIN_DIR)/scope.json XCL_EMULATION_MODE=$(TARGET) XRT_INI_PATH=$(VORTEX_RT_PATH)/xrt/xrt.ini EMCONFIG_PATH=$(FPGA_BIN_DIR) XRT_DEVICE_INDEX=$(XRT_DEVICE_INDEX) XCLBIN_PATH=$(FPGA_BIN_DIR)/vortex_afu.xclbin LD_LIBRARY_PATH=$(XILINX_XRT)/lib:$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=xrt ./$(PROJECT) $(OPTS)
 else
 	SCOPE_JSON_PATH=$(VORTEX_RT_PATH)/scope.json LD_LIBRARY_PATH=$(XILINX_XRT)/lib:$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=xrt ./$(PROJECT) $(OPTS)
 endif

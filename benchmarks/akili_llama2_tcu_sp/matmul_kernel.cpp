@@ -2,12 +2,13 @@
 #include <vx_tensor.h>
 
 #include "common.h"
+#include "akili_ablock.h"
 
 namespace vt = vortex::tensor;
-using ctx = vt::wmma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE, true>;
-using kcfg = vt::wmma_config_t<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
+using ctx = vt::wmma_context<VX_CFG_NUM_THREADS, vt::ITYPE, vt::OTYPE, true>;
+using kcfg = vt::wmma_config_t<VX_CFG_NUM_THREADS, vt::ITYPE, vt::OTYPE>;
 
-extern "C" void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
+__kernel void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
     auto A = reinterpret_cast<ctx::input_t*>(args->A_addr);
     auto B = reinterpret_cast<ctx::input_t*>(args->B_addr);
     auto C = reinterpret_cast<ctx::output_t*>(args->C_addr);
@@ -24,8 +25,8 @@ extern "C" void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
 
     constexpr uint32_t pd = kcfg::m_steps * (kcfg::k_steps / 2);
     constexpr uint32_t meta_cols = kcfg::meta_cols;
-    constexpr uint32_t num_meta_loads = (pd * meta_cols + NUM_THREADS - 1) / NUM_THREADS;
-    constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_THREADS;
+    constexpr uint32_t num_meta_loads = (pd * meta_cols + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
+    constexpr uint32_t per_k_tile_words = num_meta_loads * VX_CFG_NUM_THREADS;
 
     uint32_t num_k_tiles = args->K / ctx::tileK;
     uint32_t stride_A = args->K / 2;
@@ -35,7 +36,15 @@ extern "C" void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
     auto tileMeta = meta_base + blockIdx.y * num_k_tiles * per_k_tile_words;
 
     for (uint32_t k = 0; k < args->K; k += ctx::tileK) {
-        ctx::load_matrix_sync<vt::row_major>(fragA, tileA, stride_A, nullptr, tileMeta);
+#ifdef AKILI_A_BLOCKED
+        uint32_t kc = k / 2;
+        tileA = A + (blockIdx.y * (stride_A / kABlockCols) + kc / kABlockCols) * kABlockElems
+                  + kc % kABlockCols;
+        ctx::load_matrix_sync<vt::row_major>(fragA, tileA, kABlockCols);
+#else
+        ctx::load_matrix_sync<vt::row_major>(fragA, tileA, stride_A);
+#endif
+        ctx::load_sp_metadata(fragA, tileMeta);
         ctx::load_matrix_sync<vt::row_major>(fragB, tileB, args->N);
         ctx::mma_sync(fragC, fragA, fragB, fragC);
         tileA += ctx::tileK / 2;

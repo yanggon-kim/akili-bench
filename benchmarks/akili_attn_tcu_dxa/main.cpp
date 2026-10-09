@@ -24,18 +24,19 @@ constexpr uint32_t kDescB_QK = 1;
 constexpr uint32_t kDescA_PV = 2;
 constexpr uint32_t kDescB_PV = 3;
 
-#ifndef NUM_THREADS
-#define NUM_THREADS 8
+#ifndef VX_CFG_NUM_THREADS
+#define VX_CFG_NUM_THREADS 8
 #endif
-#ifndef NUM_TCU_LANES
-#define NUM_TCU_LANES NUM_THREADS
+#ifndef VX_CFG_NUM_TCU_LANES
+#define VX_CFG_NUM_TCU_LANES VX_CFG_NUM_THREADS
 #endif
 
 #include <tensor_cfg.h>
+#include "wgmma_dxa_host.h"
 namespace vt = vortex::tensor;
-using cfg = vt::wmma_config_t<NUM_TCU_LANES, vt::fp16, vt::fp32>;
-static constexpr uint32_t TM = cfg::tileM;
-static constexpr uint32_t TN = cfg::tileN;
+using cfg = vt::wgmma_config_t<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, WGMMA_NRC>;
+static constexpr uint32_t TM = cfg::xtileM;
+static constexpr uint32_t TN = cfg::xtileN;
 static constexpr uint32_t TK = cfg::tileK;
 
 #define RT_CHECK(_expr)                                         \
@@ -155,16 +156,20 @@ int main(int argc, char* argv[]) {
 
   uint64_t NT_caps = 0;
   vx_dev_caps(device, VX_CAPS_NUM_THREADS, &NT_caps);
-  if ((uint32_t)NT_caps != NUM_THREADS) {
-    printf("Error: device NUM_THREADS=%u but built with NUM_THREADS=%u\n",
-           (unsigned)NT_caps, (unsigned)NUM_THREADS);
+  if ((uint32_t)NT_caps != VX_CFG_NUM_THREADS) {
+    printf("Error: device VX_CFG_NUM_THREADS=%u but built with VX_CFG_NUM_THREADS=%u\n",
+           (unsigned)NT_caps, (unsigned)VX_CFG_NUM_THREADS);
     cleanup();
     return -1;
   }
+  uint64_t issue_width = 0;
+  vx_dev_caps(device, VX_CAPS_ISSUE_WIDTH, &issue_width);
+  uint32_t wg_warps = akili_cta_warps(issue_width);
+  uint32_t cta_M = wg_warps * TM;
 
   // Pad N, d to TCU tile multiples.
   auto round_up = [](uint32_t v, uint32_t m) { return ((v + m - 1) / m) * m; };
-  uint32_t n_align = std::max({TM, TN, TK});
+  uint32_t n_align = std::max({cta_M, TN, TK});
   uint32_t d_align = std::max(TK, TN);
   uint32_t N = round_up(N_req, n_align);
   uint32_t d = round_up(d_req, d_align);
@@ -227,7 +232,6 @@ int main(int argc, char* argv[]) {
     RT_CHECK(vx_copy_to_dev(V_fp16_buffer, h_V_cm.data(), 0, in_fp16_bytes));
   }
 
-  RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_mem_alloc(device, sizeof(kernel_arg_t), VX_MEM_READ_WRITE, &args_buffer));
 
   // ---- Program DXA descriptors once (addresses are stable) ----
@@ -238,35 +242,36 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescA_QK, kernel_arg.Q_addr,
     /*size0=*/d, /*size1=*/N,
     /*stride0_bytes=*/d * sizeof(uint16_t),
-    /*tile0=*/TK, /*tile1=*/TM, /*elem_bytes=*/sizeof(uint16_t)));
+    /*tile0=*/akili_wg_stage_k<cfg>(false), /*tile1=*/cta_M, /*elem_bytes=*/sizeof(uint16_t)));
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescB_QK, kernel_arg.K_addr,
     /*size0=*/d, /*size1=*/N,
     /*stride0_bytes=*/d * sizeof(uint16_t),
-    /*tile0=*/TK, /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
+    /*tile0=*/akili_wg_stage_k<cfg>(false), /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescA_PV, P_fp16_addr,
     /*size0=*/N, /*size1=*/N,
     /*stride0_bytes=*/N * sizeof(uint16_t),
-    /*tile0=*/TK, /*tile1=*/TM, /*elem_bytes=*/sizeof(uint16_t)));
+    /*tile0=*/akili_wg_stage_k<cfg>(false), /*tile1=*/cta_M, /*elem_bytes=*/sizeof(uint16_t)));
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescB_PV, kernel_arg.V_addr,
     /*size0=*/N, /*size1=*/d,
     /*stride0_bytes=*/N * sizeof(uint16_t),
-    /*tile0=*/TK, /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
+    /*tile0=*/akili_wg_stage_k<cfg>(false), /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
 
   int errors = 0;
   const float atol = 2e-2f;
   const float rtol = 2e-2f;
 
-  uint32_t gemm_smem_size = (TM * TK + TN * TK) * sizeof(uint16_t);
+  uint32_t gemm_smem_size = akili_wg_lmem_bytes<cfg>(cta_M, false);
 
   // ---------------- Stage 1: S = Q @ K^T (dense TCU, DXA) ----------------
   std::cout << "=== Stage 1: S = Q @ K^T (dense TCU, DXA) ===" << std::endl;
   {
     kernel_arg.kernel_id = KID_QK_TCU;
     RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-    uint32_t grid_dim[2]  = {N / TN, N / TM};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
+    uint32_t grid_dim[2]  = {N / TN, N / cta_M};
+    uint32_t block_dim[2] = {wg_warps * VX_CFG_NUM_THREADS, 1};
     auto t0 = std::chrono::high_resolution_clock::now();
-    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, gemm_smem_size));
+    RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 2,
+                           grid_dim, block_dim, gemm_smem_size));
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
     auto t1 = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count();
@@ -302,12 +307,13 @@ int main(int argc, char* argv[]) {
     kernel_arg.P_addr    = P_fp32_addr;
     kernel_arg.kernel_id = KID_SOFTMAX;
     RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-    // NUM_WARPS CTAs × NUM_THREADS threads to match baseline parallelism.
+    // VX_CFG_NUM_WARPS CTAs × VX_CFG_NUM_THREADS threads to match baseline parallelism.
     // Hardcoded to 8 warps (matches the 1c_w8_t8 bitstream this targets).
     uint32_t grid_dim[2]  = {8, 1};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
+    uint32_t block_dim[2] = {VX_CFG_NUM_THREADS, 1};
     auto t0 = std::chrono::high_resolution_clock::now();
-    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
+    RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 2,
+                           grid_dim, block_dim, 0));
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
     auto t1 = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count();
@@ -342,10 +348,11 @@ int main(int argc, char* argv[]) {
   kernel_arg.kernel_id = KID_PV_TCU;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
   {
-    uint32_t grid_dim[2]  = {d / TN, N / TM};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
+    uint32_t grid_dim[2]  = {d / TN, N / cta_M};
+    uint32_t block_dim[2] = {wg_warps * VX_CFG_NUM_THREADS, 1};
     auto t0 = std::chrono::high_resolution_clock::now();
-    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, gemm_smem_size));
+    RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 2,
+                           grid_dim, block_dim, gemm_smem_size));
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
     auto t1 = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count();

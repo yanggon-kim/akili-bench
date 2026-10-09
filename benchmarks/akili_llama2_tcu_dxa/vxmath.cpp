@@ -4,6 +4,7 @@
 #include <cstring>
 #include <iostream>
 #include <vector>
+#include "akili_ablock.h"
 
 #include <dxa.h>
 #include <rvfloats.h>
@@ -11,6 +12,7 @@
 #include <vortex.h>
 
 #include "common.h"
+#include "wgmma_dxa_host.h"
 
 #define RT_CHECK(_expr)                                         \
     do {                                                        \
@@ -22,7 +24,7 @@
     } while (false)
 
 namespace vt = vortex::tensor;
-using cfg = vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp32>;
+using cfg = vt::wgmma_config_t<VX_CFG_NUM_THREADS, vt::fp16, vt::fp32, WGMMA_NRC>;
 using itype_t = typename vt::fp16::dtype;
 using otype_t = typename vt::fp32::dtype;
 
@@ -50,6 +52,7 @@ static uint16_t float_to_fp16(float value) {
 static uint64_t num_cores = 0;
 static uint64_t num_warps = 0;
 static uint64_t num_threads = 0;
+static uint64_t issue_width = 0;
 
 static vx_device_h device = nullptr;
 static vx_buffer_h matmul_A_buffer = nullptr;
@@ -87,6 +90,8 @@ void vx_init() {
     RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_CORES, &num_cores));
     RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_WARPS, &num_warps));
     RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_THREADS, &num_threads));
+    RT_CHECK(vx_dev_caps(device, VX_CAPS_ISSUE_WIDTH, &issue_width));
+    issue_width = akili_cta_warps(issue_width);
 
     uint64_t isa_flags = 0;
     RT_CHECK(vx_dev_caps(device, VX_CAPS_ISA_FLAGS, &isa_flags));
@@ -99,8 +104,8 @@ void vx_init() {
         exit(-1);
     }
 
-    if (num_threads != NUM_THREADS) {
-        std::cerr << "TCU kernel expects NUM_THREADS=" << NUM_THREADS
+    if (num_threads != VX_CFG_NUM_THREADS) {
+        std::cerr << "TCU kernel expects VX_CFG_NUM_THREADS=" << VX_CFG_NUM_THREADS
                   << ", but device reports " << num_threads << std::endl;
         exit(-1);
     }
@@ -147,23 +152,37 @@ static void pack_row_major_fp16(std::vector<itype_t>& dst,
 static void program_dxa_descriptors(uint32_t padded_M,
                                     uint32_t padded_N,
                                     uint32_t padded_K) {
+#ifdef AKILI_A_BLOCKED
+    RT_CHECK(vx_dxa_program_desc_2d(device, kDescA, matmul_kernel_arg.A_addr,
+        /*size0=*/padded_K * kABlockRows, /*size1=*/padded_M / kABlockRows,
+        /*stride0_bytes=*/padded_K * kABlockRows * sizeof(itype_t),
+        /*tile0=*/kABlockElems, /*tile1=*/issue_width * cfg::xtileM / kABlockRows,
+        /*elem_bytes=*/sizeof(itype_t)));
+#else
     RT_CHECK(vx_dxa_program_desc_2d(device, kDescA, matmul_kernel_arg.A_addr,
         /*size0=*/padded_K, /*size1=*/padded_M,
         /*stride0_bytes=*/padded_K * sizeof(itype_t),
-        /*tile0=*/cfg::tileK, /*tile1=*/cfg::tileM,
+        /*tile0=*/akili_wg_stage_k<cfg>(false), /*tile1=*/issue_width * cfg::xtileM,
         /*elem_bytes=*/sizeof(itype_t)));
+#endif
 
     RT_CHECK(vx_dxa_program_desc_2d(device, kDescB, matmul_kernel_arg.B_addr,
         /*size0=*/padded_N, /*size1=*/padded_K,
         /*stride0_bytes=*/padded_N * sizeof(itype_t),
-        /*tile0=*/cfg::tileN, /*tile1=*/cfg::tileK,
+        /*tile0=*/cfg::xtileN, /*tile1=*/akili_wg_stage_k<cfg>(false),
         /*elem_bytes=*/sizeof(itype_t)));
+    RT_CHECK(akili_dxa_set_kmajor(device, kDescB, sizeof(itype_t)));
 }
 
 static void vx_matmul_tcu(float* C, const float* A, const float* B, int M, int N, int K) {
-    uint32_t padded_M = round_up(M, cfg::tileM);
-    uint32_t padded_N = round_up(N, cfg::tileN);
+    uint32_t cta_M = issue_width * cfg::xtileM;
+    uint32_t padded_M = round_up(M, cta_M);
+    uint32_t padded_N = round_up(N, cfg::xtileN);
+#ifdef AKILI_A_BLOCKED
+    uint32_t padded_K = round_up(K, kABlockCols);
+#else
     uint32_t padded_K = round_up(K, cfg::tileK);
+#endif
 
     size_t sizeA = static_cast<size_t>(padded_M) * padded_K;
     size_t sizeB = static_cast<size_t>(padded_K) * padded_N;
@@ -174,6 +193,9 @@ static void vx_matmul_tcu(float* C, const float* A, const float* B, int M, int N
     std::vector<otype_t> host_C(sizeC, 0.0f);
 
     pack_row_major_fp16(host_A, A, M, K, padded_K);
+#ifdef AKILI_A_BLOCKED
+    akili_block_a(host_A, padded_M, padded_K);
+#endif
     pack_row_major_fp16(host_B, B, K, N, padded_N);
 
     matmul_kernel_arg.M = padded_M;
@@ -187,10 +209,7 @@ static void vx_matmul_tcu(float* C, const float* A, const float* B, int M, int N
     ensure_buffer(&matmul_C_buffer, &cached_C_bytes, sizeC * sizeof(otype_t),
                   VX_MEM_WRITE, &matmul_kernel_arg.C_addr);
 
-    if (!kernel_loaded) {
-        RT_CHECK(vx_upload_kernel_file(device, kernel, &matmul_krnl_buffer));
-        kernel_loaded = true;
-    }
+    kernel_loaded = true;
 
     if (!matmul_args_buffer) {
         RT_CHECK(vx_mem_alloc(device, sizeof(matmul_kernel_args_t), VX_MEM_READ, &matmul_args_buffer));
@@ -205,13 +224,13 @@ static void vx_matmul_tcu(float* C, const float* A, const float* B, int M, int N
 
     RT_CHECK(vx_copy_to_dev(matmul_args_buffer, &matmul_kernel_arg, 0, sizeof(matmul_kernel_args_t)));
 
-    uint32_t grid_dim[2] = {padded_N / cfg::tileN, padded_M / cfg::tileM};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
+    uint32_t grid_dim[2] = {padded_N / cfg::xtileN, padded_M / cta_M};
+    uint32_t block_dim[2] = {(uint32_t)issue_width * VX_CFG_NUM_THREADS, 1};
     // Shared memory: A tile [tileM × tileK] + B tile [tileK × tileN], both row-major.
-    uint32_t smem_size = (cfg::tileM * cfg::tileK + cfg::tileK * cfg::tileN) * sizeof(itype_t);
+    uint32_t smem_size = akili_wg_lmem_bytes<cfg>(cta_M, false);
 
-    RT_CHECK(vx_start_g(device, matmul_krnl_buffer, matmul_args_buffer, 2,
-                        grid_dim, block_dim, smem_size));
+    RT_CHECK(akili_start_g(device, &matmul_kernel_arg, sizeof(matmul_kernel_arg),
+                           2, grid_dim, block_dim, smem_size));
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
     RT_CHECK(vx_copy_from_dev(host_C.data(), matmul_C_buffer, 0, sizeC * sizeof(otype_t)));
 

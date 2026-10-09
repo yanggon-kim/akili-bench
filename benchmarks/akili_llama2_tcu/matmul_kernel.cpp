@@ -1,6 +1,7 @@
 #include <vx_spawn2.h>
 #include <vx_tensor.h>
 #include "common.h"
+#include "akili_ablock.h"
 
 // Task C instrumentation (guarded by AKILI_NONDXA_INSTRUMENT). Mirrors the
 // DXA instrumentation in akili_llama2_tcu_dxa so per-iter compute (load_A +
@@ -12,9 +13,9 @@
 #endif
 
 namespace vt = vortex::tensor;
-using ctx = vt::wmma_context<NUM_THREADS, vt::ITYPE, vt::OTYPE>;
+using ctx = vt::wmma_context<VX_CFG_NUM_THREADS, vt::ITYPE, vt::OTYPE>;
 
-extern "C" void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
+__kernel void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
     auto A = reinterpret_cast<ctx::input_t*>(args->A_addr);
     auto B = reinterpret_cast<ctx::input_t*>(args->B_addr);
     auto C = reinterpret_cast<ctx::output_t*>(args->C_addr);
@@ -38,13 +39,20 @@ extern "C" void kernel_main(matmul_kernel_args_t* __UNIFORM__ args) {
 #endif
 
     for (uint32_t k = 0; k < args->K; k += ctx::tileK) {
+#ifdef AKILI_A_BLOCKED
+        auto tileA = A + (blockIdx.y * (args->K / kABlockCols) + k / kABlockCols) * kABlockElems
+                       + k % kABlockCols;
+        constexpr uint32_t lda = kABlockCols;
+#else
         auto tileA = A + tile_row * args->K + k;
+        const uint32_t lda = args->K;
+#endif
         auto tileB = B + k * args->N + tile_col;
 
 #ifdef AKILI_NONDXA_INSTRUMENT
         uint32_t t0 = csr_read(0xB00);
 #endif
-        ctx::load_matrix_sync(fragA, tileA, args->K);
+        ctx::load_matrix_sync(fragA, tileA, lda);
         ctx::load_matrix_sync(fragB, tileB, args->N);
 #ifdef AKILI_NONDXA_INSTRUMENT
         uint32_t t0b = csr_read(0xB00);

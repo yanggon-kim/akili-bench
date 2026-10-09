@@ -4,7 +4,7 @@
 #include "common.h"
 
 namespace vt = vortex::tensor;
-using tcu_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
+using tcu_ctx = vt::wmma_context<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
 
 // =============================================================================
 // akili_acccnn_tcu — Dense TCU conv2d via GEMM over (W_gemm × Icol).

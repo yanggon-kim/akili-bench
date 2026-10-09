@@ -26,10 +26,10 @@
 #define MLP_W            256    // hidden width, multiple of tileM=tileN at all NTs
 #define MLP_DEPTH        4
 #define MLP_OUT_DIM      4
-#ifndef NUM_THREADS
-#define NUM_THREADS 8
+#ifndef VX_CFG_NUM_THREADS
+#define VX_CFG_NUM_THREADS 8
 #endif
-#if NUM_THREADS >= 16
+#if VX_CFG_NUM_THREADS >= 16
 #define MLP_OUT_DIM_PAD  16     // padded to tileM = 16 at NT=16/32
 #else
 #define MLP_OUT_DIM_PAD  8      // padded to tileM = 8 at NT=8

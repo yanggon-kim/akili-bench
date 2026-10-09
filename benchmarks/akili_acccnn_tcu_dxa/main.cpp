@@ -22,18 +22,19 @@
 constexpr uint32_t kDescA = 0;
 constexpr uint32_t kDescB = 1;
 
-#ifndef NUM_THREADS
-#define NUM_THREADS 8
+#ifndef VX_CFG_NUM_THREADS
+#define VX_CFG_NUM_THREADS 8
 #endif
-#ifndef NUM_TCU_LANES
-#define NUM_TCU_LANES NUM_THREADS
+#ifndef VX_CFG_NUM_TCU_LANES
+#define VX_CFG_NUM_TCU_LANES VX_CFG_NUM_THREADS
 #endif
 
 #include <tensor_cfg.h>
+#include "wgmma_dxa_host.h"
 namespace vt = vortex::tensor;
-using cfg = vt::wmma_config_t<NUM_TCU_LANES, vt::fp16, vt::fp32>;
-static constexpr uint32_t TM = cfg::tileM;
-static constexpr uint32_t TN = cfg::tileN;
+using cfg = vt::wgmma_config_t<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, WGMMA_NRC>;
+static constexpr uint32_t TM = cfg::xtileM;
+static constexpr uint32_t TN = cfg::xtileN;
 static constexpr uint32_t TK = cfg::tileK;
 
 #define RT_CHECK(_expr)                                         \
@@ -164,7 +165,7 @@ static void read_back_cycles() {
   kernel_arg_t back = {};
   vx_copy_from_dev(&back, args_buffer, 0, sizeof(kernel_arg_t));
   printf("KCYC[CONV,nt=%u]: %lu\n",
-         (unsigned)NUM_THREADS, (unsigned long)back.kernel_cycles);
+         (unsigned)VX_CFG_NUM_THREADS, (unsigned long)back.kernel_cycles);
 }
 
 int main(int argc, char* argv[]) {
@@ -174,12 +175,16 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_dev_open(&device));
   uint64_t NT_caps = 0;
   vx_dev_caps(device, VX_CAPS_NUM_THREADS, &NT_caps);
-  if ((uint32_t)NT_caps != NUM_THREADS) {
-    printf("Error: device NUM_THREADS=%u but built with NUM_THREADS=%u\n",
-           (unsigned)NT_caps, (unsigned)NUM_THREADS);
+  if ((uint32_t)NT_caps != VX_CFG_NUM_THREADS) {
+    printf("Error: device VX_CFG_NUM_THREADS=%u but built with VX_CFG_NUM_THREADS=%u\n",
+           (unsigned)NT_caps, (unsigned)VX_CFG_NUM_THREADS);
     cleanup();
     return -1;
   }
+  uint64_t issue_width = 0;
+  vx_dev_caps(device, VX_CAPS_ISSUE_WIDTH, &issue_width);
+  uint32_t wg_warps = akili_cta_warps(issue_width);
+  uint32_t cta_M = wg_warps * TM;
 
   uint32_t C_in  = C_in_req;
   uint32_t C_out = C_out_req;
@@ -192,7 +197,7 @@ int main(int argc, char* argv[]) {
   uint32_t KK    = C_in * K * K;
 
   auto round_up = [](uint32_t v, uint32_t m) { return ((v + m - 1) / m) * m; };
-  uint32_t M_gemm = round_up(C_out, TM);
+  uint32_t M_gemm = round_up(C_out, cta_M);
   uint32_t N_gemm = round_up(N_out, TN);
   uint32_t K_gemm = round_up(KK, TK);
 
@@ -238,7 +243,6 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_copy_to_dev(Icol_buffer, h_Icol_fp16.data(), 0,
                           h_Icol_fp16.size() * sizeof(uint16_t)));
 
-  RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_mem_alloc(device, sizeof(kernel_arg_t), VX_MEM_READ_WRITE, &args_buffer));
 
   kernel_arg.C_in  = C_in;
@@ -252,8 +256,8 @@ int main(int argc, char* argv[]) {
   kernel_arg.N_gemm = N_gemm;
   kernel_arg.K_gemm = K_gemm;
   kernel_arg.grid_dim[0]  = N_gemm / TN;
-  kernel_arg.grid_dim[1]  = M_gemm / TM;
-  kernel_arg.block_dim[0] = NUM_THREADS;
+  kernel_arg.grid_dim[1]  = M_gemm / cta_M;
+  kernel_arg.block_dim[0] = wg_warps * VX_CFG_NUM_THREADS;
   kernel_arg.block_dim[1] = 1;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
 
@@ -264,17 +268,18 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescA, kernel_arg.W_addr,
     /*size0=*/K_gemm, /*size1=*/M_gemm,
     /*stride0_bytes=*/K_gemm * sizeof(uint16_t),
-    /*tile0=*/TK, /*tile1=*/TM, /*elem_bytes=*/sizeof(uint16_t)));
+    /*tile0=*/akili_wg_stage_k<cfg>(false), /*tile1=*/cta_M, /*elem_bytes=*/sizeof(uint16_t)));
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescB, kernel_arg.B_addr,
     /*size0=*/K_gemm, /*size1=*/N_gemm,
     /*stride0_bytes=*/K_gemm * sizeof(uint16_t),
-    /*tile0=*/TK, /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
+    /*tile0=*/akili_wg_stage_k<cfg>(false), /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
 
-  uint32_t grid_dim[2]  = {N_gemm / TN, M_gemm / TM};
-  uint32_t block_dim[2] = {NUM_THREADS, 1};
-  uint32_t smem_size    = (TM * TK + TN * TK) * sizeof(uint16_t);
+  uint32_t grid_dim[2]  = {N_gemm / TN, M_gemm / cta_M};
+  uint32_t block_dim[2] = {wg_warps * VX_CFG_NUM_THREADS, 1};
+  uint32_t smem_size    = akili_wg_lmem_bytes<cfg>(cta_M, false);
 
-  RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, smem_size));
+  RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 2,
+                         grid_dim, block_dim, smem_size));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
   // read_back_cycles();  // kernel_arg.kernel_cycles not populated in DXA variant
 

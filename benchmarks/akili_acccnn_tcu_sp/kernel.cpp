@@ -4,7 +4,7 @@
 #include "common.h"
 
 namespace vt = vortex::tensor;
-using sp_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
+using sp_ctx = vt::wmma_context<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
 
 // =============================================================================
 // akili_acccnn_tcu_sp — Sparse (2:4) TCU conv2d via im2col + sgemm_tcu_sp-style
@@ -34,11 +34,11 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   sp_ctx::fill_fragment(fragC, 0);
 
   constexpr uint32_t rtl_i_ratio = 32 / vt::fp16::bits;
-  constexpr uint32_t meta_cols = (NUM_TCU_LANES * 2 * rtl_i_ratio + 31) / 32;
-  using kcfg = vt::wmma_config_t<NUM_TCU_LANES>;
+  constexpr uint32_t meta_cols = (VX_CFG_NUM_TCU_LANES * 2 * rtl_i_ratio + 31) / 32;
+  using kcfg = vt::wmma_config_t<VX_CFG_NUM_TCU_LANES>;
   constexpr uint32_t PD = kcfg::m_steps * (kcfg::k_steps / 2);
-  constexpr uint32_t num_meta_loads = (PD * meta_cols + NUM_TCU_LANES - 1) / NUM_TCU_LANES;
-  constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_TCU_LANES;
+  constexpr uint32_t num_meta_loads = (PD * meta_cols + VX_CFG_NUM_TCU_LANES - 1) / VX_CFG_NUM_TCU_LANES;
+  constexpr uint32_t per_k_tile_words = num_meta_loads * VX_CFG_NUM_TCU_LANES;
 
   uint32_t num_k_tiles = K / sp_ctx::tileK;
   uint32_t tile_row_idx = blockIdx.y;
@@ -50,7 +50,8 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   // B as plain col-major (sgemm_tcu_sp pattern). pTileB advances by sp_ctx::tileK each K-iter.
   auto pTileB = pB + tile_col * K;
   for (int i = 0; i < (int)K; i += (int)sp_ctx::tileK) {
-    sp_ctx::load_matrix_sync<vt::row_major>(fragA, pTileA, stride_A, nullptr, pMetaSp);
+    sp_ctx::load_matrix_sync<vt::row_major>(fragA, pTileA, stride_A);
+    sp_ctx::load_sp_metadata(fragA, pMetaSp);
     sp_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, K);
     sp_ctx::mma_sync(fragC, fragA, fragB, fragC);
     pMetaSp += per_k_tile_words;

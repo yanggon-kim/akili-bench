@@ -3,6 +3,7 @@
 #include <vx_tensor.h>
 #include <vx_dxa.h>
 #include <vx_barrier.h>
+#include "wgmma_dxa_kernel.h"
 #include <math.h>
 #include "common.h"
 
@@ -13,6 +14,34 @@ static inline float fast_exp(float x) {
   float y = 1.0f + u*(1.0f + u*(0.5f + u*(0.166666667f + u*(0.041666667f + u*0.008333333f))));
   y = y*y; y = y*y; y = y*y; y = y*y; y = y*y;
   return y;
+}
+
+// Polynomial sin/cos/log for the SIMT stages. libm sinf/cosf hang
+// non-deterministically on this core at >= ~2k points (reproduced on SimX),
+// so the positional encoding and softplus avoid libm entirely.
+static inline float fast_sin(float x) {
+  const float kTwoPi = 6.28318530718f, kPi = 3.14159265359f, kHalfPi = 1.57079632679f;
+  float q = x * (1.0f / kTwoPi);
+  int n = (int)(q + (q >= 0.0f ? 0.5f : -0.5f));
+  x -= (float)n * kTwoPi;                  // [-pi, pi]
+  if (x > kHalfPi) x = kPi - x;            // fold to [-pi/2, pi/2]
+  else if (x < -kHalfPi) x = -kPi - x;
+  float x2 = x * x;
+  return x * (1.0f + x2 * (-1.0f / 6.0f + x2 * (1.0f / 120.0f
+           + x2 * (-1.0f / 5040.0f + x2 * (1.0f / 362880.0f)))));
+}
+static inline float fast_cos(float x) { return fast_sin(x + 1.57079632679f); }
+
+// log(x) for x >= 1 (softplus argument): exponent from the float bits plus an
+// atanh series on the mantissa in [1, 2).
+static inline float fast_log(float x) {
+  if (!(x < 3.0e38f)) return x;
+  union { float f; uint32_t u; } v = { x };
+  int e = (int)((v.u >> 23) & 0xff) - 127;
+  v.u = (v.u & 0x007fffffu) | 0x3f800000u;
+  float z = (v.f - 1.0f) / (v.f + 1.0f), z2 = z * z;
+  float lm = 2.0f * z * (1.0f + z2 * (1.0f / 3.0f + z2 * (1.0f / 5.0f + z2 * (1.0f / 7.0f + z2 * (1.0f / 9.0f)))));
+  return (float)e * 0.69314718056f + lm;
 }
 
 // HYBRID variant: only kDescB is used — W compressed + meta are read inline
@@ -26,7 +55,8 @@ constexpr uint32_t kDescB = 1;  // activations X [K_in x n_points] row-major
 // =============================================================================
 
 namespace vt = vortex::tensor;
-using sp_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
+using sp_ctx = vt::wgmma_context<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, true,
+                                 WGMMA_NRC>;
 
 static inline uint16_t d_f2h(float x) {
   uint32_t bits;
@@ -93,12 +123,12 @@ static inline void ray_setup_body(kernel_arg_t* arg) {
   float freq = 1.0f;
   for (int L = 0; L < PE_L; ++L) {
     uint32_t base = 3 + L*6;
-    pe_out[(base+0) * n_pts + pt] = d_f2h(sinf(freq * px));
-    pe_out[(base+1) * n_pts + pt] = d_f2h(cosf(freq * px));
-    pe_out[(base+2) * n_pts + pt] = d_f2h(sinf(freq * py));
-    pe_out[(base+3) * n_pts + pt] = d_f2h(cosf(freq * py));
-    pe_out[(base+4) * n_pts + pt] = d_f2h(sinf(freq * pz));
-    pe_out[(base+5) * n_pts + pt] = d_f2h(cosf(freq * pz));
+    pe_out[(base+0) * n_pts + pt] = d_f2h(fast_sin(freq * px));
+    pe_out[(base+1) * n_pts + pt] = d_f2h(fast_cos(freq * px));
+    pe_out[(base+2) * n_pts + pt] = d_f2h(fast_sin(freq * py));
+    pe_out[(base+3) * n_pts + pt] = d_f2h(fast_cos(freq * py));
+    pe_out[(base+4) * n_pts + pt] = d_f2h(fast_sin(freq * pz));
+    pe_out[(base+5) * n_pts + pt] = d_f2h(fast_cos(freq * pz));
     freq *= 2.0f;
   }
   for (uint32_t f = MLP_IN_DIM; f < MLP_IN_DIM_PAD; ++f)
@@ -109,61 +139,10 @@ static inline void ray_setup_body(kernel_arg_t* arg) {
 // Stage 2: SPARSE TCU MLP layer.
 // -----------------------------------------------------------------------------
 static inline void mlp_gemm_body(kernel_arg_t* arg) {
-  auto pW = reinterpret_cast<sp_ctx::input_t*>(arg->W_cur_addr);
   auto pC = reinterpret_cast<sp_ctx::output_t*>(arg->Y_cur_addr);
-
-  uint32_t K_in  = arg->K_in_cur;
-  uint32_t n_pts = arg->n_points;
-
-  sp_ctx::fragment_a   fragA;
-  sp_ctx::fragment_b   fragB;
-  sp_ctx::fragment_acc fragC;
-
-  uint32_t tile_row = blockIdx.y * sp_ctx::tileM;
-  uint32_t tile_col = blockIdx.x * sp_ctx::tileN;
-  sp_ctx::fill_fragment(fragC, 0);
-
-  constexpr uint32_t rtl_i_ratio = 32 / vt::fp16::bits;
-  constexpr uint32_t meta_cols = (NUM_TCU_LANES * 2 * rtl_i_ratio + 31) / 32;
-  using kcfg = vt::wmma_config_t<NUM_TCU_LANES>;
-  constexpr uint32_t PD = kcfg::m_steps * (kcfg::k_steps / 2);
-  constexpr uint32_t num_meta_loads = (PD * meta_cols + NUM_TCU_LANES - 1) / NUM_TCU_LANES;
-  constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_TCU_LANES;
-
-  uint32_t num_k_tiles = K_in / sp_ctx::tileK;
-  uint32_t stride_A = K_in / 2;
-
-  // Inline gmem pointers for W and meta (non-DXA pattern).
-  auto tileA    = pW + tile_row * stride_A;
-  auto pMetaDDR = reinterpret_cast<const float*>(arg->meta_cur_addr)
-                + blockIdx.y * num_k_tiles * per_k_tile_words;
-
-  // SMEM: only B tile (tileK × tileN fp16). No A/meta SMEM regions.
-  auto B_smem = reinterpret_cast<sp_ctx::input_t*>(__local_mem());
-
-  vortex::barrier bar(0);
-  const bool is_dxa_warp = (csr_read(VX_CSR_CTA_RANK) == 0);
-
-  for (uint32_t i = 0; i < K_in; i += sp_ctx::tileK) {
-    if (is_dxa_warp) {
-      // B row-major (K_in × n_points): tile at (row=i, col=tile_col).
-      vx_dxa_issue_2d_wg(kDescB, bar.id(), B_smem, tile_col, i);
-    }
-    bar.arrive_and_wait();
-
-    // W (compressed) + meta loaded directly from gmem (non-DXA pattern).
-    sp_ctx::load_matrix_sync<vt::row_major>(fragA, tileA, stride_A, nullptr, pMetaDDR);
-    // B loaded from SMEM (DXA-staged).
-    sp_ctx::load_matrix_sync(fragB, B_smem, sp_ctx::tileN);
-    sp_ctx::mma_sync(fragC, fragA, fragB, fragC);
-
-    tileA    += sp_ctx::tileK / 2;
-    pMetaDDR += per_k_tile_words;
-    bar.arrive_and_wait();
-  }
-
-  auto pTileC = pC + tile_row * n_pts + tile_col;
-  sp_ctx::store_matrix_sync(pTileC, fragC, n_pts);
+  auto meta = reinterpret_cast<const uint32_t*>(arg->meta_cur_addr);
+  akili::sparse_wgmma_dxa<sp_ctx, true>(pC, meta, arg->n_points, arg->K_in_cur,
+                                   kDescA, kDescB);
 }
 
 static inline void mlp_act_body(kernel_arg_t* arg) {
@@ -198,7 +177,7 @@ static inline void mlp_out_act_body(kernel_arg_t* arg) {
   float r  = pY_fp32[1 * n_pts + tid] + pB[1];
   float g  = pY_fp32[2 * n_pts + tid] + pB[2];
   float b  = pY_fp32[3 * n_pts + tid] + pB[3];
-  pSig[tid]        = logf(1.0f + fast_exp(s));
+  pSig[tid]        = fast_log(1.0f + fast_exp(s));
   pRGB[tid*3 + 0]  = 1.0f / (1.0f + fast_exp(-r));
   pRGB[tid*3 + 1]  = 1.0f / (1.0f + fast_exp(-g));
   pRGB[tid*3 + 2]  = 1.0f / (1.0f + fast_exp(-b));

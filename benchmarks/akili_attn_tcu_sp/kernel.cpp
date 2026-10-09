@@ -6,8 +6,8 @@
 #include <algorithm>
 
 namespace vt = vortex::tensor;
-using sp_ctx    = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
-using dense_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
+using sp_ctx    = vt::wmma_context<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, true>;
+using dense_ctx = vt::wmma_context<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
 
 // Fast fp32 exp: avoids libm expf's softfloat-double fallback on rv32if.
 // Branchless Taylor-then-square: u = x/32, Taylor(u), then y^32 via 5 squarings.
@@ -30,8 +30,8 @@ static inline void softmax_body(kernel_arg_t* arg) {
   uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= N) return;
 
-  uint32_t hw_tid = blockIdx.x * NUM_THREADS + threadIdx.x;
-  uint32_t stride = gridDim.x * NUM_THREADS;
+  uint32_t hw_tid = blockIdx.x * VX_CFG_NUM_THREADS + threadIdx.x;
+  uint32_t stride = gridDim.x * VX_CFG_NUM_THREADS;
 
   for (uint32_t row = hw_tid; row < N; row += stride) {
     float max_val = S[row * N];
@@ -73,11 +73,11 @@ static inline void qk_sparse_body(kernel_arg_t* arg) {
   sp_ctx::fill_fragment(fragC, 0);
 
   constexpr uint32_t rtl_i_ratio = 32 / vt::fp16::bits;
-  constexpr uint32_t meta_cols = (NUM_TCU_LANES * 2 * rtl_i_ratio + 31) / 32;
-  using kcfg = vt::wmma_config_t<NUM_TCU_LANES>;
+  constexpr uint32_t meta_cols = (VX_CFG_NUM_TCU_LANES * 2 * rtl_i_ratio + 31) / 32;
+  using kcfg = vt::wmma_config_t<VX_CFG_NUM_TCU_LANES>;
   constexpr uint32_t PD = kcfg::m_steps * (kcfg::k_steps / 2);
-  constexpr uint32_t num_meta_loads = (PD * meta_cols + NUM_TCU_LANES - 1) / NUM_TCU_LANES;
-  constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_TCU_LANES;
+  constexpr uint32_t num_meta_loads = (PD * meta_cols + VX_CFG_NUM_TCU_LANES - 1) / VX_CFG_NUM_TCU_LANES;
+  constexpr uint32_t per_k_tile_words = num_meta_loads * VX_CFG_NUM_TCU_LANES;
   uint32_t num_k_tiles = K_walk / sp_ctx::tileK;
   uint32_t stride_A = K_walk / 2;
 
@@ -87,7 +87,8 @@ static inline void qk_sparse_body(kernel_arg_t* arg) {
   constexpr uint32_t a_k_stride = sp_ctx::tileK / 2;
 
   for (int i = 0; i < (int)K_walk; i += (int)sp_ctx::tileK) {
-    sp_ctx::load_matrix_sync<vt::row_major>(fragA, pTileA, stride_A, nullptr, pMetaSp);
+    sp_ctx::load_matrix_sync<vt::row_major>(fragA, pTileA, stride_A);
+    sp_ctx::load_sp_metadata(fragA, pMetaSp);
     sp_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, K_walk);
     sp_ctx::mma_sync(fragC, fragA, fragB, fragC);
     pMetaSp += per_k_tile_words;
@@ -117,11 +118,11 @@ static inline void pv_sparse_body(kernel_arg_t* arg) {
   sp_ctx::fill_fragment(fragC, 0);
 
   constexpr uint32_t rtl_i_ratio = 32 / vt::fp16::bits;
-  constexpr uint32_t meta_cols = (NUM_TCU_LANES * 2 * rtl_i_ratio + 31) / 32;
-  using kcfg = vt::wmma_config_t<NUM_TCU_LANES>;
+  constexpr uint32_t meta_cols = (VX_CFG_NUM_TCU_LANES * 2 * rtl_i_ratio + 31) / 32;
+  using kcfg = vt::wmma_config_t<VX_CFG_NUM_TCU_LANES>;
   constexpr uint32_t PD = kcfg::m_steps * (kcfg::k_steps / 2);
-  constexpr uint32_t num_meta_loads = (PD * meta_cols + NUM_TCU_LANES - 1) / NUM_TCU_LANES;
-  constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_TCU_LANES;
+  constexpr uint32_t num_meta_loads = (PD * meta_cols + VX_CFG_NUM_TCU_LANES - 1) / VX_CFG_NUM_TCU_LANES;
+  constexpr uint32_t per_k_tile_words = num_meta_loads * VX_CFG_NUM_TCU_LANES;
   uint32_t num_k_tiles = K_walk / sp_ctx::tileK;
   uint32_t stride_A = K_walk / 2;
 
@@ -131,7 +132,8 @@ static inline void pv_sparse_body(kernel_arg_t* arg) {
   constexpr uint32_t a_k_stride = sp_ctx::tileK / 2;
 
   for (int i = 0; i < (int)K_walk; i += (int)sp_ctx::tileK) {
-    sp_ctx::load_matrix_sync<vt::row_major>(fragA, pTileA, stride_A, nullptr, pMetaSp);
+    sp_ctx::load_matrix_sync<vt::row_major>(fragA, pTileA, stride_A);
+    sp_ctx::load_sp_metadata(fragA, pMetaSp);
     sp_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, K_walk);
     sp_ctx::mma_sync(fragC, fragA, fragB, fragC);
     pMetaSp += per_k_tile_words;

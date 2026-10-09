@@ -6,7 +6,7 @@
 #include <algorithm>
 
 namespace vt = vortex::tensor;
-using tcu_ctx = vt::wmma_context<NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
+using tcu_ctx = vt::wmma_context<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
 
 // Fast fp32 exp: avoids libm expf's softfloat-double fallback on rv32if.
 // Branchless: clamp x to [-80, 0-ish], Taylor around u = x/32 (converges fast),
@@ -31,8 +31,8 @@ static inline void softmax_body(kernel_arg_t* arg) {
   uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= N) return;
 
-  uint32_t hw_tid = blockIdx.x * NUM_THREADS + threadIdx.x;
-  uint32_t stride = gridDim.x * NUM_THREADS;
+  uint32_t hw_tid = blockIdx.x * VX_CFG_NUM_THREADS + threadIdx.x;
+  uint32_t stride = gridDim.x * VX_CFG_NUM_THREADS;
 
   for (uint32_t row = hw_tid; row < N; row += stride) {
     float max_val = S[row * N];

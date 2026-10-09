@@ -81,10 +81,16 @@ static float* load_checkpoint(const char* path, Config* cfg, Weights* w,
     size_t file_size = st.st_size;
     void* map = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED) { fprintf(stderr, "mmap failed\n"); exit(1); }
-    std::memcpy(cfg, map, sizeof(Config));
+    // v2 ("LLM3") checkpoints prefix the 7 legacy fields with a magic word and
+    // append 6 RoPE-scaling fields; legacy (Llama-2 style) ones start at dim.
+    static const int32_t LLAMA_HDR_MAGIC = 0x4c4c4d33;
+    const int32_t* hdr = (const int32_t*)map;
+    size_t header_words = 7;
+    if (hdr[0] == LLAMA_HDR_MAGIC) { ++hdr; header_words = 1 + 7 + 6; }
+    std::memcpy(cfg, hdr, sizeof(Config));
     int shared = cfg->vocab_size > 0 ? 1 : 0;
     cfg->vocab_size = std::abs(cfg->vocab_size);
-    float* wptr = (float*)map + sizeof(Config) / sizeof(float);
+    float* wptr = (float*)map + header_words;
     map_weights(w, cfg, wptr, shared);
     *fd_out = fd;
     *size_out = file_size;
@@ -133,7 +139,7 @@ int main(int argc, char** argv) {
     // Allocate X [dim x L] (column-major logical: K=dim, N=L) and scratch
     // Y with room for the widest output (max of dim, hidden_dim, vocab_size).
     int max_M = std::max(dim, std::max(hidden_dim, vocab_size));
-    std::vector<float> X((size_t)dim * L);
+    std::vector<float> X((size_t)std::max(dim, hidden_dim) * L);
     std::vector<float> Y((size_t)max_M * L);
 
     std::mt19937 rng(42);

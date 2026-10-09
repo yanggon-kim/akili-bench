@@ -29,25 +29,23 @@ constexpr uint32_t kDescB_QK    = 1;
 constexpr uint32_t kDescA_PV    = 2;
 constexpr uint32_t kDescB_PV    = 3;
 
-#ifndef NUM_THREADS
-#define NUM_THREADS 8
+#ifndef VX_CFG_NUM_THREADS
+#define VX_CFG_NUM_THREADS 8
 #endif
-#ifndef NUM_TCU_LANES
-#define NUM_TCU_LANES NUM_THREADS
+#ifndef VX_CFG_NUM_TCU_LANES
+#define VX_CFG_NUM_TCU_LANES VX_CFG_NUM_THREADS
 #endif
 
 #include <tensor_cfg.h>
-#include <tensor.h>  // prune_2to4_matrix, compress_2to4_matrix
+#include <tensor_sp.h>  // prune_2to4_matrix, compress_2to4_matrix
+#include "wgmma_dxa_host.h"
 namespace vt = vortex::tensor;
-using cfg = vt::wmma_config_t<NUM_TCU_LANES, vt::fp16, vt::fp32>;
-static constexpr uint32_t TM = cfg::tileM;
-static constexpr uint32_t TN = cfg::tileN;
-static constexpr uint32_t TK = cfg::tileK;
+using cfg = vt::wgmma_config_t<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, WGMMA_NRC>;
+static constexpr uint32_t TM = cfg::xtileM;
+static constexpr uint32_t TN = cfg::xtileN;
+static constexpr uint32_t TK = cfg::tileK_sp;
 
-static constexpr uint32_t PD               = cfg::m_steps * (cfg::k_steps / 2);
-static constexpr uint32_t num_meta_loads   = (PD * cfg::meta_cols + NUM_THREADS - 1) / NUM_THREADS;
-static constexpr uint32_t per_k_tile_words = num_meta_loads * NUM_THREADS;
-
+#if 0
 static void pack_metadata(std::vector<uint32_t>& h_meta,
                           const std::vector<uint8_t>& masks,
                           uint32_t M, uint32_t K) {
@@ -57,11 +55,11 @@ static void pack_metadata(std::vector<uint32_t>& h_meta,
   constexpr uint32_t meta_row_w = TC_K * 2 * I_RATIO;
   constexpr uint32_t mcols = cfg::meta_cols;
   constexpr uint32_t half_k_steps = cfg::k_steps / 2;
-  constexpr uint32_t banks_per_store = (NUM_THREADS < PD) ? NUM_THREADS : PD;
-  constexpr uint32_t stores_per_col = (PD + NUM_THREADS - 1) / NUM_THREADS;
-  constexpr uint32_t cols_per_load = (NUM_THREADS >= PD) ? (NUM_THREADS / PD) : 1;
-  constexpr uint32_t nml = (PD * mcols + NUM_THREADS - 1) / NUM_THREADS;
-  constexpr uint32_t pktw = nml * NUM_THREADS;
+  constexpr uint32_t banks_per_store = (VX_CFG_NUM_THREADS < PD) ? VX_CFG_NUM_THREADS : PD;
+  constexpr uint32_t stores_per_col = (PD + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
+  constexpr uint32_t cols_per_load = (VX_CFG_NUM_THREADS >= PD) ? (VX_CFG_NUM_THREADS / PD) : 1;
+  constexpr uint32_t nml = (PD * mcols + VX_CFG_NUM_THREADS - 1) / VX_CFG_NUM_THREADS;
+  constexpr uint32_t pktw = nml * VX_CFG_NUM_THREADS;
 
   uint32_t tileK_elem = cfg::tileK;
   uint32_t num_groups_per_row = K / 4;
@@ -103,7 +101,7 @@ static void pack_metadata(std::vector<uint32_t>& h_meta,
                 uint32_t flat_store = word_idx * stores_per_col + store_in_col;
                 uint32_t load_idx = flat_store / cols_per_load;
                 uint32_t store_in_load = flat_store % cols_per_load;
-                uint32_t meta_idx = load_idx * NUM_THREADS + store_in_load * banks_per_store + thread_in_store;
+                uint32_t meta_idx = load_idx * VX_CFG_NUM_THREADS + store_in_load * banks_per_store + thread_in_store;
                 h_meta[section_base + meta_idx] |= (1u << bit_idx);
               }
             }
@@ -113,6 +111,7 @@ static void pack_metadata(std::vector<uint32_t>& h_meta,
     }
   }
 }
+#endif
 
 #define RT_CHECK(_expr)                                         \
    do {                                                         \
@@ -243,15 +242,19 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_dev_open(&device));
   uint64_t NT_caps = 0;
   vx_dev_caps(device, VX_CAPS_NUM_THREADS, &NT_caps);
-  if ((uint32_t)NT_caps != NUM_THREADS) {
-    printf("Error: device NUM_THREADS=%u but built with NUM_THREADS=%u\n",
-           (unsigned)NT_caps, (unsigned)NUM_THREADS);
+  if ((uint32_t)NT_caps != VX_CFG_NUM_THREADS) {
+    printf("Error: device VX_CFG_NUM_THREADS=%u but built with VX_CFG_NUM_THREADS=%u\n",
+           (unsigned)NT_caps, (unsigned)VX_CFG_NUM_THREADS);
     cleanup();
     return -1;
   }
+  uint64_t issue_width = 0;
+  vx_dev_caps(device, VX_CAPS_ISSUE_WIDTH, &issue_width);
+  uint32_t wg_warps = akili_cta_warps(issue_width);
+  uint32_t cta_M = wg_warps * TM;
 
   auto round_up = [](uint32_t v, uint32_t m) { return ((v + m - 1) / m) * m; };
-  uint32_t n_align = std::max({TM, TN, TK});
+  uint32_t n_align = std::max({cta_M, TN, TK});
   uint32_t d_align = std::max(TK, TN);
   uint32_t N = round_up(N_req, n_align);
   uint32_t d = round_up(d_req, d_align);
@@ -288,7 +291,7 @@ int main(int argc, char* argv[]) {
     printf("compress_2to4_matrix(Q) failed\n"); cleanup(); return -1;
   }
   std::vector<uint32_t> h_meta_Q;
-  pack_metadata(h_meta_Q, sparse_masks_Q, N, d);
+  akili_pack_wgmma_metadata<cfg, vt::fp16>(h_meta_Q, sparse_masks_Q, N, d);
 
   // ---- Pack K (col-major) and V (col-major) as fp16 ----
   std::vector<uint16_t> h_K_cm(N * d);
@@ -339,7 +342,6 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_copy_to_dev(K_fp16_buf, h_K_cm.data(),         0, in_fp16_bytes));
   RT_CHECK(vx_copy_to_dev(V_fp16_buf, h_V_cm.data(),         0, in_fp16_bytes));
 
-  RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_mem_alloc(device, sizeof(kernel_arg_t), VX_MEM_READ_WRITE, &args_buffer));
 
   // ---- Program DXA descriptors for QK upfront ----
@@ -353,27 +355,29 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescA_QK, kernel_arg.Q_addr,
     /*size0=*/d / 2, /*size1=*/N,
     /*stride0_bytes=*/(d / 2) * sizeof(uint16_t),
-    /*tile0=*/TK / 2, /*tile1=*/TM, /*elem_bytes=*/sizeof(uint16_t)));
+    /*tile0=*/akili_wg_stage_k<cfg>(true) / 2, /*tile1=*/cta_M, /*elem_bytes=*/sizeof(uint16_t)));
+  RT_CHECK(akili_wg_program_meta<cfg>(device, kDescA_QK, kernel_arg.meta_Q_addr, N, d, cta_M));
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescB_QK, kernel_arg.K_addr,
     /*size0=*/d, /*size1=*/N,
     /*stride0_bytes=*/d * sizeof(uint16_t),
-    /*tile0=*/TK, /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
+    /*tile0=*/akili_wg_stage_k<cfg>(true), /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
 
   int errors = 0;
   const float atol = 2e-2f;
   const float rtol = 2e-2f;
 
   // Task 8 HYBRID: LMEM is B tile only (A + meta loaded inline from gmem).
-  uint32_t gemm_smem_size = TN * TK * sizeof(uint16_t);
+  uint32_t gemm_smem_size = akili_wg_lmem_bytes<cfg>(cta_M, true);
 
   // ---------------- Stage 1: sparse QK ----------------
   std::cout << "=== Stage 1: S = Q @ K^T (sparse TCU, DXA) ===" << std::endl;
   {
     kernel_arg.kernel_id = KID_QK_SPARSE;
     RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-    uint32_t grid_dim[2]  = {N / TN, N / TM};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
-    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, gemm_smem_size));
+    uint32_t grid_dim[2]  = {N / TN, N / cta_M};
+    uint32_t block_dim[2] = {wg_warps * VX_CFG_NUM_THREADS, 1};
+    RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 2,
+                           grid_dim, block_dim, gemm_smem_size));
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
   }
 
@@ -405,10 +409,11 @@ int main(int argc, char* argv[]) {
     kernel_arg.P_addr    = P_fp32_addr;
     kernel_arg.kernel_id = KID_SOFTMAX;
     RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
-    // 8 CTAs × NUM_THREADS threads striped across N rows — matches DXA variant.
+    // 8 CTAs × VX_CFG_NUM_THREADS threads striped across N rows — matches DXA variant.
     uint32_t grid_dim[2]  = {8, 1};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
-    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, /*smem_size=*/0));
+    uint32_t block_dim[2] = {VX_CFG_NUM_THREADS, 1};
+    RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 2,
+                           grid_dim, block_dim, 0));
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
   }
 
@@ -447,7 +452,7 @@ int main(int argc, char* argv[]) {
     printf("compress_2to4_matrix(P) failed\n"); cleanup(); return -1;
   }
   std::vector<uint32_t> h_meta_P;
-  pack_metadata(h_meta_P, sparse_masks_P, N, N);
+  akili_pack_wgmma_metadata<cfg, vt::fp16>(h_meta_P, sparse_masks_P, N, N);
 
   RT_CHECK(vx_copy_to_dev(P_sp_buffer, h_P_compressed.data(), 0,
                           (uint32_t)h_P_compressed.size() * sizeof(uint16_t)));
@@ -464,19 +469,21 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescA_PV, P_sp_addr,
     /*size0=*/N / 2, /*size1=*/N,
     /*stride0_bytes=*/(N / 2) * sizeof(uint16_t),
-    /*tile0=*/TK / 2, /*tile1=*/TM, /*elem_bytes=*/sizeof(uint16_t)));
+    /*tile0=*/akili_wg_stage_k<cfg>(true) / 2, /*tile1=*/cta_M, /*elem_bytes=*/sizeof(uint16_t)));
+  RT_CHECK(akili_wg_program_meta<cfg>(device, kDescA_PV, kernel_arg.meta_P_addr, N, N, cta_M));
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescB_PV, kernel_arg.V_addr,
     /*size0=*/N, /*size1=*/d,
     /*stride0_bytes=*/N * sizeof(uint16_t),
-    /*tile0=*/TK, /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
+    /*tile0=*/akili_wg_stage_k<cfg>(true), /*tile1=*/TN, /*elem_bytes=*/sizeof(uint16_t)));
 
   kernel_arg.P_addr    = P_sp_addr;
   kernel_arg.kernel_id = KID_PV_SPARSE;
   RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
   {
-    uint32_t grid_dim[2]  = {d / TN, N / TM};
-    uint32_t block_dim[2] = {NUM_THREADS, 1};
-    RT_CHECK(vx_start_g(device, krnl_buffer, args_buffer, 2, grid_dim, block_dim, gemm_smem_size));
+    uint32_t grid_dim[2]  = {d / TN, N / cta_M};
+    uint32_t block_dim[2] = {wg_warps * VX_CFG_NUM_THREADS, 1};
+    RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 2,
+                           grid_dim, block_dim, gemm_smem_size));
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
   }
 
