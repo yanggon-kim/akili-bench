@@ -22,6 +22,13 @@
 #include <stdio.h>
 #include "common.h"
 
+#ifndef AKILI_NERF_XPAD
+#define AKILI_NERF_XPAD 0
+#endif
+#ifndef AKILI_NERF_NB
+#define AKILI_NERF_NB 1  // output tiles per block along N, sharing each A (and metadata) load
+#endif
+
 #ifndef VX_CFG_NUM_THREADS
 #define VX_CFG_NUM_THREADS 8
 #endif
@@ -327,7 +334,7 @@ int main(int argc, char* argv[]) {
   uint32_t n_rays    = n_rays_req;
   uint32_t n_samples = n_samples_req;
   uint32_t n_points  = n_rays * n_samples;
-  if (n_points % TN != 0) {
+  if (n_points % (TN * AKILI_NERF_NB) != 0) {
     printf("Error: n_rays*n_samples=%u must be a multiple of TN=%u\n",
            n_points, TN);
     cleanup();
@@ -430,9 +437,9 @@ int main(int argc, char* argv[]) {
   // ---- Allocate device buffers ----
   uint32_t rays_bytes      = n_rays * 3 * sizeof(float);
   uint32_t aabb_bytes      = 6 * sizeof(float);
-  uint32_t pe_bytes        = MLP_IN_DIM_PAD * n_points * sizeof(uint16_t);
+  uint32_t pe_bytes        = MLP_IN_DIM_PAD * (n_points + AKILI_NERF_XPAD) * sizeof(uint16_t);
   uint32_t delta_bytes     = n_points * sizeof(float);
-  uint32_t act_bytes       = MLP_W * n_points * sizeof(uint16_t);
+  uint32_t act_bytes       = MLP_W * (n_points + AKILI_NERF_XPAD) * sizeof(uint16_t);
   uint32_t scratch_bytes   = MLP_W * n_points * sizeof(float);
   uint32_t out_head_bytes  = MLP_OUT_DIM_PAD * n_points * sizeof(float);
   uint32_t sigma_bytes     = n_points * sizeof(float);
@@ -545,7 +552,7 @@ int main(int argc, char* argv[]) {
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
   cyc_setup = read_back_cycles_tag("SETUP", gd_setup, true);
 
-  std::vector<uint16_t> h_pe_fp16(MLP_IN_DIM_PAD * n_points);
+  std::vector<uint16_t> h_pe_fp16(MLP_IN_DIM_PAD * (n_points + AKILI_NERF_XPAD));
   std::vector<float>    h_deltas(n_points);
   RT_CHECK(vx_copy_from_dev(h_pe_fp16.data(), pe_buf,    0, pe_bytes));
   RT_CHECK(vx_copy_from_dev(h_deltas.data(),  delta_buf, 0, delta_bytes));
@@ -557,7 +564,13 @@ int main(int argc, char* argv[]) {
                   n_rays, n_samples, min_near);
     int stage_err = 0;
     for (uint32_t i = 0; i < MLP_IN_DIM_PAD * n_points; ++i) {
-      float dev = h2f_host(h_pe_fp16[i]);
+#ifdef AKILI_NERF_TILEDB
+      const uint32_t k = i / n_points, n = i % n_points;
+      const uint32_t xi = ((n / TN) * (MLP_IN_DIM_PAD / TK) + k / TK) * (TK * TN) + (n % TN) * TK + k % TK;
+#else
+      const uint32_t xi = (i / n_points) * (n_points + AKILI_NERF_XPAD) + i % n_points;
+#endif
+      float dev = h2f_host(h_pe_fp16[xi]);
       if (!compare(ref_pe[i], dev, atol, rtol, (int)i, stage_err, "PE"))
         ++stage_err;
     }
@@ -624,14 +637,14 @@ int main(int argc, char* argv[]) {
     kernel_arg.kernel_id     = KID_MLP_GEMM;
     RT_CHECK(vx_copy_to_dev(args_buffer, &kernel_arg, 0, sizeof(kernel_arg_t)));
     {
-      uint32_t grid_dim[2] = {n_points / TN, p.N_out / TM};
+      uint32_t grid_dim[2] = {n_points / (TN * AKILI_NERF_NB), p.N_out / TM};
       RT_CHECK(akili_start_g(device, &kernel_arg, sizeof(kernel_arg), 2, grid_dim, block_dim, 0));
     }
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
     {
       char tag[32];
       std::snprintf(tag, sizeof(tag), "MLP_L%u_GEMM", (unsigned)L);
-      uint32_t nb = (n_points / TN) * (p.N_out / TM);
+      uint32_t nb = (n_points / (TN * AKILI_NERF_NB)) * (p.N_out / TM);
       cyc_mlp_gemm += read_back_cycles_tag(tag, nb, true);
     }
 

@@ -303,6 +303,10 @@ int main(int argc, char* argv[]) {
   for (uint32_t r = 0; r < N_req; ++r)
     for (uint32_t c = 0; c < d_req; ++c)
       h_V[r * d + c] = frand();
+  // The device computes on fp16 copies of Q, K and V; the reference uses the
+  // same values so the check measures the device, not the input rounding.
+  for (auto* m : {&h_Q, &h_K, &h_V})
+    for (auto& x : *m) x = h2f_host(f2h_host(x));
 
   // ---- Prune + compress + pack metadata for Q ----
   std::vector<uint16_t> h_Q_fp16(N * d);
@@ -461,7 +465,9 @@ int main(int argc, char* argv[]) {
     for (uint32_t r = 0; r < N_req; ++r)
       for (uint32_t c = 0; c < N_req; ++c) {
         int idx = r * N + c;
-        if (!compare(h_P_ref[idx], h_P[idx], 1e-5f, 1e-5f, idx, errors, "P"))
+        // fast_exp's absolute error is below 1.7e-6 and each row's sum is at least 1,
+        // so P is off by under 2e-6 + 8.5e-4 * P across N = 512 keys.
+        if (!compare(h_P_ref[idx], h_P[idx], 1e-5f, 2e-3f, idx, errors, "P"))
           ++errors;
       }
   }

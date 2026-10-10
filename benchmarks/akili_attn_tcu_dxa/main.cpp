@@ -61,6 +61,17 @@ static inline uint16_t f2h_host(float x) {
   return sign | ((uint16_t)exp << 10) | mant;
 }
 
+static inline float h2f_host(uint16_t x) {
+  uint32_t sign = (uint32_t)(x & 0x8000) << 16;
+  uint32_t exp  = (x >> 10) & 0x1F;
+  uint32_t mant = (x & 0x3FF);
+  uint32_t bits;
+  if (exp == 0)       bits = sign;
+  else if (exp == 31) bits = sign | 0x7F800000 | (mant << 13);
+  else                bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+  float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+}
+
 static bool compare(float a, float b, float atol, float rtol,
                     int index, int& errors, const char* tag) {
   auto diff = std::fabs(a - b);
@@ -189,6 +200,10 @@ int main(int argc, char* argv[]) {
   for (uint32_t r = 0; r < N_req; ++r)
     for (uint32_t c = 0; c < d_req; ++c)
       h_V[r * d + c] = frand();
+  // The device computes on fp16 copies of Q, K and V; the reference uses the
+  // same values so the check measures the device, not the input rounding.
+  for (auto* m : {&h_Q, &h_K, &h_V})
+    for (auto& x : *m) x = h2f_host(f2h_host(x));
 
   uint32_t in_fp16_bytes = N * d * sizeof(uint16_t);
   uint32_t s_fp32_bytes  = N * N * sizeof(float);
@@ -328,7 +343,9 @@ int main(int argc, char* argv[]) {
     for (uint32_t r = 0; r < N_req; ++r)
       for (uint32_t c = 0; c < N_req; ++c) {
         int idx = r * N + c;
-        if (!compare(h_P_ref[idx], h_P[idx], 1e-5f, 1e-5f, idx, errors, "P"))
+        // fast_exp's absolute error is below 1.7e-6 and each row's sum is at least 1,
+        // so P is off by under 2e-6 + 8.5e-4 * P across N = 512 keys.
+        if (!compare(h_P_ref[idx], h_P[idx], 1e-5f, 2e-3f, idx, errors, "P"))
           ++errors;
       }
   }
@@ -342,6 +359,7 @@ int main(int argc, char* argv[]) {
   {
     std::vector<uint16_t> h_P_fp16(N * N);
     for (uint32_t i = 0; i < N * N; ++i) h_P_fp16[i] = f2h_host(h_P[i]);
+    for (uint32_t i = 0; i < N * N; ++i) h_P[i] = h2f_host(h_P_fp16[i]);
     RT_CHECK(vx_copy_to_dev(P_fp16_buffer, h_P_fp16.data(), 0, s_fp16_bytes));
   }
   kernel_arg.P_addr    = P_fp16_addr;

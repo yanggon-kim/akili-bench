@@ -192,6 +192,11 @@ int main(int argc, char** argv) {
 
     printf("PREFILL[L=%d]: %ld us (%.3f ms)\n", L, us, us / 1000.0);
     printf("  matmuls=%d (7*n_layers + 1 LM head)\n", 7 * n_layers + 1);
+    {
+        double sum = 0.0, asum = 0.0;
+        for (size_t i = 0; i < (size_t)vocab_size * L; ++i) { sum += Y[i]; asum += std::fabs(Y[i]); }
+        printf("  output checksum: sum=%.9e abs=%.9e\n", sum, asum);
+    }
 
     matmul_cleanup();
 

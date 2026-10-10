@@ -55,6 +55,29 @@ static inline float fast_log(float x) {
 namespace vt = vortex::tensor;
 using tcu_ctx = vt::wmma_context<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32, false>;
 
+// Extra elements per activation row. The rows are n_points fp16 apart, a
+// power-of-two stride that maps every B row of a tile to the same cache set.
+#ifndef AKILI_NERF_XPAD
+#define AKILI_NERF_XPAD 0
+#endif
+#ifndef AKILI_NERF_NB
+#define AKILI_NERF_NB 1  // output tiles per block along N, sharing each A (and metadata) load
+#endif
+
+// Index of activation element (k, n) of a K x n_points B operand. With
+// AKILI_NERF_TILEDB the producers write B as contiguous column-major
+// tileK x tileN blocks in the order the GEMM consumes them (column tile, then
+// K tile); otherwise B is row-major with row stride ldx.
+static inline uint32_t x_index(uint32_t k, uint32_t n, uint32_t K, uint32_t ldx) {
+#ifdef AKILI_NERF_TILEDB
+  constexpr uint32_t TKb = tcu_ctx::tileK, TNb = tcu_ctx::tileN;
+  return ((n / TNb) * (K / TKb) + k / TKb) * (TKb * TNb) + (n % TNb) * TKb + k % TKb;
+#else
+  (void)K;
+  return k * ldx + n;
+#endif
+}
+
 // fp32 -> fp16 (IEEE) packing helper.
 static inline uint16_t d_f2h(float x) {
   uint32_t bits;
@@ -82,6 +105,7 @@ static inline void ray_setup_body(kernel_arg_t* arg) {
 
   uint32_t S      = arg->n_samples;
   uint32_t n_pts  = arg->n_points;
+  uint32_t ldx    = n_pts + AKILI_NERF_XPAD;
   uint32_t ray    = pt / S;
   uint32_t s      = pt - ray * S;
   float min_near  = arg->min_near;
@@ -115,22 +139,22 @@ static inline void ray_setup_body(kernel_arg_t* arg) {
   float pz = oz + t * dz;
   dlt_out[pt] = step;
 
-  pe_out[0 * n_pts + pt] = d_f2h(px);
-  pe_out[1 * n_pts + pt] = d_f2h(py);
-  pe_out[2 * n_pts + pt] = d_f2h(pz);
+  pe_out[x_index(0, pt, MLP_IN_DIM_PAD, ldx)] = d_f2h(px);
+  pe_out[x_index(1, pt, MLP_IN_DIM_PAD, ldx)] = d_f2h(py);
+  pe_out[x_index(2, pt, MLP_IN_DIM_PAD, ldx)] = d_f2h(pz);
   float freq = 1.0f;
   for (int L = 0; L < PE_L; ++L) {
     uint32_t base = 3 + L*6;
-    pe_out[(base+0) * n_pts + pt] = d_f2h(fast_sin(freq * px));
-    pe_out[(base+1) * n_pts + pt] = d_f2h(fast_cos(freq * px));
-    pe_out[(base+2) * n_pts + pt] = d_f2h(fast_sin(freq * py));
-    pe_out[(base+3) * n_pts + pt] = d_f2h(fast_cos(freq * py));
-    pe_out[(base+4) * n_pts + pt] = d_f2h(fast_sin(freq * pz));
-    pe_out[(base+5) * n_pts + pt] = d_f2h(fast_cos(freq * pz));
+    pe_out[x_index((base+0), pt, MLP_IN_DIM_PAD, ldx)] = d_f2h(fast_sin(freq * px));
+    pe_out[x_index((base+1), pt, MLP_IN_DIM_PAD, ldx)] = d_f2h(fast_cos(freq * px));
+    pe_out[x_index((base+2), pt, MLP_IN_DIM_PAD, ldx)] = d_f2h(fast_sin(freq * py));
+    pe_out[x_index((base+3), pt, MLP_IN_DIM_PAD, ldx)] = d_f2h(fast_cos(freq * py));
+    pe_out[x_index((base+4), pt, MLP_IN_DIM_PAD, ldx)] = d_f2h(fast_sin(freq * pz));
+    pe_out[x_index((base+5), pt, MLP_IN_DIM_PAD, ldx)] = d_f2h(fast_cos(freq * pz));
     freq *= 2.0f;
   }
   for (uint32_t f = MLP_IN_DIM; f < MLP_IN_DIM_PAD; ++f)
-    pe_out[f * n_pts + pt] = 0;
+    pe_out[x_index(f, pt, MLP_IN_DIM_PAD, ldx)] = 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -143,32 +167,36 @@ static inline void mlp_gemm_body(kernel_arg_t* arg) {
 
   uint32_t K_in  = arg->K_in_cur;
   uint32_t n_pts = arg->n_points;
+  uint32_t ldx = n_pts + AKILI_NERF_XPAD;
 
   tcu_ctx::fragment_a   fragA;
   tcu_ctx::fragment_b   fragB;
-  tcu_ctx::fragment_acc fragC;
+  tcu_ctx::fragment_acc fragC[AKILI_NERF_NB];
 
   uint32_t tile_row = blockIdx.y * tcu_ctx::tileM;
-  uint32_t tile_col = blockIdx.x * tcu_ctx::tileN;
-  tcu_ctx::fill_fragment(fragC, 0);
+  uint32_t tile_col = blockIdx.x * tcu_ctx::tileN * AKILI_NERF_NB;
+#pragma unroll
+  for (uint32_t j = 0; j < AKILI_NERF_NB; ++j)
+    tcu_ctx::fill_fragment(fragC[j], 0);
 
   for (int i = 0; i < (int)K_in; i += (int)tcu_ctx::tileK) {
     auto pTileA = pA + tile_row * K_in + i;
     tcu_ctx::load_matrix_sync(fragA, pTileA, K_in);
+#pragma unroll
+    for (uint32_t j = 0; j < AKILI_NERF_NB; ++j) {
+      auto pTileB = pB + x_index(i, tile_col + j * tcu_ctx::tileN, K_in, ldx);
 #ifdef AKILI_NERF_TILEDB
-    // Timing experiment only: contiguous tileK x tileN B block per K-tile.
-    auto pTileB = pB + ((size_t)blockIdx.x * (K_in / tcu_ctx::tileK) + i / tcu_ctx::tileK)
-                     * (tcu_ctx::tileK * tcu_ctx::tileN);
-    tcu_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, tcu_ctx::tileK);
+      tcu_ctx::load_matrix_sync<vt::col_major>(fragB, pTileB, tcu_ctx::tileK);
 #else
-    auto pTileB = pB + i * n_pts + tile_col;
-    tcu_ctx::load_matrix_sync(fragB, pTileB, n_pts);
+      tcu_ctx::load_matrix_sync(fragB, pTileB, ldx);
 #endif
-    tcu_ctx::mma_sync(fragC, fragA, fragB, fragC);
+      tcu_ctx::mma_sync(fragC[j], fragA, fragB, fragC[j]);
+    }
   }
 
-  auto pTileC = pC + tile_row * n_pts + tile_col;
-  tcu_ctx::store_matrix_sync(pTileC, fragC, n_pts);
+#pragma unroll
+  for (uint32_t j = 0; j < AKILI_NERF_NB; ++j)
+    tcu_ctx::store_matrix_sync(pC + tile_row * n_pts + tile_col + j * tcu_ctx::tileN, fragC[j], n_pts);
 }
 
 // -----------------------------------------------------------------------------
@@ -189,7 +217,7 @@ static inline void mlp_act_body(kernel_arg_t* arg) {
 
   float v = pY_fp32[row * n_pts + col] + pB[row];
   if (v < 0.0f) v = 0.0f;
-  pOut[row * n_pts + col] = d_f2h(v);
+  pOut[x_index(row, col, arg->N_out_cur, n_pts + AKILI_NERF_XPAD)] = d_f2h(v);
 }
 
 // -----------------------------------------------------------------------------

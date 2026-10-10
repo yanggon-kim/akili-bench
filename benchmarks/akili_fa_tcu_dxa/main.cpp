@@ -33,6 +33,15 @@ constexpr uint32_t kDescQ = 0;
 constexpr uint32_t kDescK = 1;
 constexpr uint32_t kDescV = 2;
 constexpr uint32_t kWarpsPerCta = FA_BR / VX_CFG_NUM_THREADS;
+// Q (dense size) + FA_STAGES K/V stages + P + S, as laid out in kernel.cpp.
+#if defined(FA_REGSM) && defined(FA_OLMEM)
+constexpr uint32_t kLmemBytes = FA_BR * FA_D * 2 + FA_STAGES * 2 * FA_KV * FA_D * 2 + FA_BR * FA_BC * 2
+                              + FA_BR * FA_D * 4;
+#elif defined(FA_REGSM)
+constexpr uint32_t kLmemBytes = FA_BR * FA_D * 2 + FA_STAGES * 2 * FA_KV * FA_D * 2 + FA_BR * FA_BC * 2;
+#else
+constexpr uint32_t kLmemBytes = FA_BR * FA_D * 2 + FA_STAGES * 2 * FA_KV * FA_D * 2 + FA_BR * FA_BC * 6;
+#endif
 
 static vx_device_h device = nullptr;
 static vx_buffer_h Q_buf = nullptr, K_buf = nullptr, V_buf = nullptr, O_buf = nullptr, M_buf = nullptr;
@@ -97,7 +106,7 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "-n") && i + 1 < argc) N = (uint32_t)atoi(argv[++i]);
   }
-  if (N % FA_BR || N % FA_BC) {
+  if (N % FA_BR || N % FA_KV) {
     printf("Error: N=%u must be a multiple of %u\n", N, FA_BR);
     return -1;
   }
@@ -161,15 +170,15 @@ int main(int argc, char** argv) {
   // Q: A operand, row-major [Br x q_cols] per CTA.
   RT_CHECK(vx_dxa_program_desc_2d(device, kDescQ, arg.Q_addr, q_cols, N, q_cols * 2, q_cols, FA_BR, 2));
   // K: B of Q Kᵀ — row-major K rows are already the K-major [Bc][d] tile.
-  RT_CHECK(vx_dxa_program_desc_2d(device, kDescK, arg.K_addr, d, N, d * 2, d, FA_BC, 2));
+  RT_CHECK(vx_dxa_program_desc_2d(device, kDescK, arg.K_addr, d, N, d * 2, d, FA_KV, 2));
   // V: B of P V — DXA transposes [Bc keys][d] into the K-major [d][Bc] tile.
-  RT_CHECK(vx_dxa_program_desc_2d(device, kDescV, arg.V_addr, d, N, d * 2, d, FA_BC, 2));
+  RT_CHECK(vx_dxa_program_desc_2d(device, kDescV, arg.V_addr, d, N, d * 2, d, FA_KV, 2));
   RT_CHECK(akili_dxa_set_kmajor(device, kDescV, 2));
 
   uint32_t grid[2] = {N / FA_BR, 1};
   uint32_t block[2] = {kWarpsPerCta * VX_CFG_NUM_THREADS, 1};
   auto t0 = std::chrono::high_resolution_clock::now();
-  RT_CHECK(akili_start_g(device, &arg, sizeof(arg), 1, grid, block, 16384));
+  RT_CHECK(akili_start_g(device, &arg, sizeof(arg), 1, grid, block, kLmemBytes));
   auto t1 = std::chrono::high_resolution_clock::now();
   printf("FLASH: %ld us (grid=%u)\n",
          (long)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(), grid[0]);

@@ -10,8 +10,12 @@
 #ifndef FA_D
 #define FA_D   32
 #endif
-#define FA_BR  32   // query rows per CTA (4 warps x tileM)
+#ifndef FA_BR
+#define FA_BR  16   // query rows per CTA (2 warps x tileM)
+#endif
+#ifndef FA_BC
 #define FA_BC  32   // keys per tile
+#endif
 
 typedef struct {
   uint64_t Q_addr;     // fp16 [N x d] row-major (FA_SPARSE: compressed [N x d/2])

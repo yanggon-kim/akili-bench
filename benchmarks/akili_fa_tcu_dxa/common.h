@@ -9,8 +9,19 @@
 // FA_SPARSE prunes Q 2:4 on the host so Q·Kᵀ runs on sparse WGMMA; P·V stays
 // dense.
 #define FA_D   32   // head dimension
-#define FA_BR  32   // query rows per CTA (4 warps x xtileM)
-#define FA_BC  32   // keys per K/V tile (xtileN at NRC=32)
+#ifndef FA_BR
+#define FA_BR  32   // query rows per CTA (FA_BR / xtileM warps)
+#endif
+#ifndef FA_BC
+#define FA_BC  32   // keys per K/V tile (Q·Kᵀ accumulator width xtileN)
+#endif
+#ifndef FA_SUB
+#define FA_SUB 1   // S sub-tiles per K/V tile (K/V fetched FA_BC * FA_SUB keys at a time)
+#endif
+#define FA_KV  (FA_BC * FA_SUB)
+#ifndef FA_STAGES
+#define FA_STAGES 2  // K/V pipeline depth (1 halves the K/V LMEM)
+#endif
 
 typedef struct {
   uint64_t Q_addr;   // fp16 [N x d] row-major (FA_SPARSE: compressed [N x d/2])

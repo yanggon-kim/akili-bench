@@ -2,6 +2,7 @@
 #include <vx_tensor.h>
 #include <vx_intrinsics.h>
 #include "common.h"
+#include "fa_softmax.h"
 
 namespace vt = vortex::tensor;
 #ifdef FA_SPARSE
@@ -21,7 +22,13 @@ static_assert(FA_D % TK == 0 && FA_D % TN == 0, "head dim must be a multiple of 
 constexpr uint32_t kWarpS = TM * FA_BC * 4;
 constexpr uint32_t kWarpP = TM * FA_BC * 2;
 constexpr uint32_t kWarpO = TM * FA_D * 4;
-constexpr uint32_t kWarpBytes = kWarpS + kWarpP + kWarpO;
+#if defined(FA_SPARSE) && !defined(FA_META_GLOBAL)
+constexpr uint32_t kMetaWords = (FA_D / TK) * qk_ctx::meta_stride;
+constexpr uint32_t kWarpMeta  = kMetaWords * 4;
+#else
+constexpr uint32_t kWarpMeta  = 0;
+#endif
+constexpr uint32_t kWarpBytes = kWarpS + kWarpP + kWarpO + kWarpMeta;
 
 static inline float fast_exp(float x) {
   x = x < -80.0f ? -80.0f : x;
@@ -60,6 +67,16 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   auto Qw = reinterpret_cast<const qk_ctx::input_t*>(arg->Q_addr) + wrow0 * (FA_D / 2);
   auto Mw = reinterpret_cast<const uint32_t*>(arg->meta_addr)
           + (wrow0 / TM) * (FA_D / TK) * qk_ctx::meta_stride;
+#ifndef FA_META_GLOBAL
+  // Q's metadata is the same for every key tile: stage it in shared memory
+  // once instead of fetching it from global memory before every MMA.
+  auto Ms = reinterpret_cast<uint32_t*>(smem + kWarpS + kWarpP + kWarpO);
+  for (uint32_t i = lane; i < kMetaWords; i += VX_CFG_NUM_THREADS)
+    Ms[i] = Mw[i];
+  vx_fence();
+#else
+  auto Ms = Mw;
+#endif
 #else
   auto Qw = reinterpret_cast<const qk_ctx::input_t*>(arg->Q_addr) + wrow0 * FA_D;
 #endif
@@ -72,6 +89,8 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
   float m_i = -1.0e30f;
   float l_i = 0.0f;
 
+#if FA_D <= 32
+  // Q stays in registers across all key tiles.
   qk_ctx::fragment_a   fragQ[FA_D / TK];
   for (uint32_t k = 0; k < FA_D; k += TK) {
 #ifdef FA_SPARSE
@@ -80,6 +99,10 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
     qk_ctx::load_matrix_sync(fragQ[k / TK], Qw + k, FA_D);
 #endif
   }
+#else
+  // Wider heads do not fit 32 FP registers: Q fragments are reloaded per MMA.
+  qk_ctx::fragment_a   fQl;
+#endif
   qk_ctx::fragment_b   fragK;
   qk_ctx::fragment_acc fragS;
   pv_ctx::fragment_a   fragP;
@@ -93,9 +116,18 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
     for (uint32_t n = 0; n < FA_BC; n += TN) {
       qk_ctx::fill_fragment(fragS, 0);
       for (uint32_t k = 0; k < FA_D; k += TK) {
+#if FA_D <= 32
         auto& fQ = fragQ[k / TK];
+#else
+        auto& fQ = fQl;
 #ifdef FA_SPARSE
-        qk_ctx::load_sp_metadata(fQ, Mw + (k / TK) * qk_ctx::meta_stride);
+        qk_ctx::load_matrix_sync(fQ, Qw + k / 2, FA_D / 2);
+#else
+        qk_ctx::load_matrix_sync(fQ, Qw + k, FA_D);
+#endif
+#endif
+#ifdef FA_SPARSE
+        qk_ctx::load_sp_metadata(fQ, Ms + (k / TK) * qk_ctx::meta_stride);
 #endif
         qk_ctx::load_matrix_sync<vt::col_major>(fragK, K + (key0 + n) * FA_D + k, FA_D);
         qk_ctx::mma_sync(fragS, fQ, fragK, fragS);
@@ -105,6 +137,7 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
     vx_fence();
 
     // Online softmax: this lane owns query row wrow0 + lane.
+#ifdef FA_SOFTMAX_REF
     float m_new = m_i;
     for (uint32_t j = 0; j < FA_BC; ++j)
       m_new = srow[j] > m_new ? srow[j] : m_new;
@@ -117,6 +150,10 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
     }
     l_i = l_i * scale + sum;
     m_i = m_new;
+#else
+    const float scale = fa_softmax_tile(srow, prow, m_i, l_i);
+#endif
+#pragma unroll
     for (uint32_t j = 0; j < FA_D; ++j)
       orow[j] *= scale;
     vx_fence();

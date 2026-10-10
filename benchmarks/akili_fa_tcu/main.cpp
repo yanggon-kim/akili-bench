@@ -31,7 +31,12 @@ using cfg = vt::wmma_config_t<VX_CFG_NUM_TCU_LANES, vt::fp16, vt::fp32>;
   } while (false)
 
 constexpr uint32_t kWarpsPerCta = FA_BR / cfg::tileM;
-constexpr uint32_t kLmemBytes = kWarpsPerCta * cfg::tileM * (FA_BC * 4 + FA_BC * 2 + FA_D * 4);
+#if defined(FA_SPARSE) && !defined(FA_META_GLOBAL)
+constexpr uint32_t kMetaBytes = kWarpsPerCta * (FA_D / cfg::tileK) * cfg::num_meta_loads * VX_CFG_NUM_THREADS * 4;
+#else
+constexpr uint32_t kMetaBytes = 0;
+#endif
+constexpr uint32_t kLmemBytes = kWarpsPerCta * cfg::tileM * (FA_BC * 4 + FA_BC * 2 + FA_D * 4) + kMetaBytes;
 
 static vx_device_h device = nullptr;
 static vx_buffer_h Q_buf = nullptr, K_buf = nullptr, V_buf = nullptr, O_buf = nullptr, M_buf = nullptr;
